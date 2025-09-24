@@ -382,11 +382,10 @@ elif page == "Sales Log":
 
 
 # ---------------- Collections ----------------
-# --- inside Collections page ---
 elif page == "Collections":
     st.title("💰 Collections")
 
-     # Step 1: If collection just added, show success + ask for another
+    # Step 1: If collection just added, show success + ask for another
     if "collection_added_quote" in st.session_state and st.session_state["collection_added_quote"] is not None:
         st.success(f"✅ Collection successfully added for Quote ID {st.session_state['collection_added_quote']}")
 
@@ -395,12 +394,12 @@ elif page == "Collections":
         if add_another == "No":
             st.subheader("All Collections Data")
             st.dataframe(collections)
-            st.stop()  # Stop here — don't show form
+            st.session_state["collection_added_quote"] = None  # Reset the quote ID after viewing the data
+            st.stop()  # Stop here — don't show form again
         else:
             # Reset flags for next collection
             st.session_state["collection_added_quote"] = None
             st.session_state.pop("collection_submitted", None)
-
 
     won_sales = sales[sales["Status"] == "Won"]
     options = ["Select a QuoteID or Client"] + [
@@ -421,8 +420,6 @@ elif page == "Collections":
             st.write(f"Remaining Balance Due: ${remaining_balance_due:.2f}")
         
             deposit_paid_input = st.number_input("Deposit Paid", value=0.0, min_value=0.0, format="%.2f")
-           
-
             status_input = st.selectbox(
                 "Status",
                 options=["Pending", "Partially Paid", "Paid", "Overdue"],
@@ -473,8 +470,6 @@ elif page == "Collections":
                 # Show success and rerun to trigger radio prompt
                 st.session_state["collection_added_quote"] = selected_quote_id
                 safe_rerun()
-
-
 
     st.subheader("All Collections Data")
     st.dataframe(collections)
