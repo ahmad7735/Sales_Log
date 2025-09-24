@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
+import io
+
 
 # File path
 EXCEL_FILE = "data.xlsx"
@@ -120,6 +122,7 @@ def safe_rerun():
 
 
 
+
 # Load data initially
 sales, collections, assignments = load_data()
 sales = sync_deposit_paid(sales, collections)
@@ -127,7 +130,9 @@ collections = update_balance_due(sales, collections)
 
 # Sidebar
 st.sidebar.title("Navigation")
-page = st.sidebar.radio("Go to", ["Dashboard", "Sales Log", "Collections", "Assignments"])
+# Sidebar navigation - Add "View Reports" here
+page = st.sidebar.radio("Select Page", ["Dashboard", "Sales Log", "Collections", "Assignments", "View Reports"])
+
 
 # ---------------- Dashboard ----------------
 if page == "Dashboard":
@@ -629,10 +634,59 @@ if page == "Assignments":
     # Step 4: No need to show "Current Assignments" separately here, as it's shown after the form
 
 
-    # Step 4: No need to show "Current Assignments" separately here, as it's shown after the form
+# ---------------- View Reports ----------------
 
-        
-    #st.subheader("Current Assignments")
-    #st.dataframe(assignments)
-    
-    # Step 3: No need to show "Current Assignments" separately here, as it's shown after the form
+# View Reports page logic
+if page == "View Reports":
+    st.title("📊 View Reports")
+    st.markdown("Here you can view and download reports for Sales Log, Collections, and Assignments.")
+
+    # Load data (using your existing function)
+    sales, collections, assignments = load_data()
+
+    # Show the individual tabs for Sales Log, Collections, and Assignments
+    report_tabs = st.radio("Select a Report to View", ("Sales Log", "Collections", "Assignments"))
+
+    if report_tabs == "Sales Log":
+        st.subheader("Sales Log")
+        st.write(sales)
+
+    elif report_tabs == "Collections":
+        st.subheader("Collections")
+        st.write(collections)
+
+    elif report_tabs == "Assignments":
+        st.subheader("Assignments")
+        st.write(assignments)
+
+    # Download button for unified report (Excel file with three tabs)
+    st.subheader("Download Unified Report")
+    st.markdown("Click the button below to download the report with Sales Log, Collections, and Assignments as separate tabs in an Excel file.")
+
+    # Create an in-memory Excel file with three sheets
+    def create_excel_report(sales, collections, assignments):
+        # Create a BytesIO object to save the Excel file in-memory
+        excel_file = io.BytesIO()
+
+        with pd.ExcelWriter(excel_file, engine='xlsxwriter') as writer:
+            # Write each DataFrame to a separate sheet
+            sales.to_excel(writer, sheet_name="Sales Log", index=False)
+            collections.to_excel(writer, sheet_name="Collections", index=False)
+            assignments.to_excel(writer, sheet_name="Assignments", index=False)
+
+        # Seek to the beginning of the BytesIO buffer before sending it to Streamlit
+        excel_file.seek(0)
+        return excel_file
+
+    # When the button is pressed, create the Excel file and offer it for download
+    if st.button("Download Unified Report"):
+        excel_file = create_excel_report(sales, collections, assignments)
+
+        # Provide a download link for the user
+        st.download_button(
+            label="Download Unified Report (Excel)",
+            data=excel_file,
+            file_name="unified_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
