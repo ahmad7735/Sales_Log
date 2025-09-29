@@ -10,7 +10,6 @@ import tempfile
 # File path
 EXCEL_FILE = "data.xlsx"
 import os
-st.caption(f"Using data file: {os.path.abspath(EXCEL_FILE)}")
 
 # ---------------- Data IO ----------------
 # Removing @st.cache_data to avoid caching issues
@@ -30,6 +29,8 @@ def load_data():
     # Ensure dates
     if "StartDate" in sales.columns:
         sales["StartDate"] = pd.to_datetime(sales["StartDate"], errors="coerce")
+    if "EndDate" in sales.columns:
+        sales["EndDate"] = pd.to_datetime(sales["EndDate"], errors="coerce")
 
     # Ensure QuoteID column exists
     if "QuoteID" not in sales.columns:
@@ -47,10 +48,6 @@ def load_data():
         collections["Status"] = ""
 
     return sales, collections, assignments
-
-
-
-
 
 
 def save_data(sales, collections, assignments):
@@ -101,6 +98,36 @@ def save_data(sales, collections, assignments):
             collections_to_save.to_excel(writer, sheet_name="Collections", index=False)
             assignments_to_save.to_excel(writer, sheet_name="Assignments", index=False)
 
+            # >>> Apply Excel number formats (currency + date + percent display) <<<
+            from openpyxl.utils import get_column_letter
+
+            wb = writer.book
+            ws_sales = writer.sheets["SalesLog"]
+            ws_col = writer.sheets["Collections"]
+
+            currency_fmt = '"$"#,##0.00'
+            date_fmt = 'yyyy-mm-dd'
+            percent_literal_fmt = '0.00"%"'  # shows 20 as 20.00% (no scaling)
+
+            def format_column(ws, df, col_name, num_fmt):
+                if col_name in df.columns:
+                    col_idx = df.columns.get_loc(col_name) + 1  # 1-based
+                    col_letter = get_column_letter(col_idx)
+                    # skip header at row 1
+                    for cell in ws[col_letter][1:]:
+                        cell.number_format = num_fmt
+
+            # SalesLog: $ for money, date-only for dates, literal % for Deposit%
+            format_column(ws_sales, sales_to_save, "QuotedPrice", currency_fmt)
+            format_column(ws_sales, sales_to_save, "DepositPaid", currency_fmt)
+            format_column(ws_sales, sales_to_save, "StartDate", date_fmt)
+            format_column(ws_sales, sales_to_save, "EndDate", date_fmt)
+            format_column(ws_sales, sales_to_save, "Deposit%", percent_literal_fmt)
+
+            # Collections: $ for money
+            format_column(ws_col, collections_to_save, "DepositPaid", currency_fmt)
+            format_column(ws_col, collections_to_save, "BalanceDue", currency_fmt)
+
         os.replace(tmp_path, os.path.abspath(EXCEL_FILE))  # atomic replace
         return True
     except PermissionError:
@@ -144,32 +171,22 @@ def sync_deposit_paid(sales: pd.DataFrame, collections: pd.DataFrame) -> pd.Data
     return s
 
 
-    # Attach Sales' current deposit (treated as "initial") to each collections row
+    # (unused legacy code below intentionally preserved but never reached)
     merged = c.merge(
         s[["QuoteID", "DepositPaid"]].rename(columns={"DepositPaid": "InitialDeposit"}),
         on="QuoteID", how="left"
     )
     merged["InitialDeposit"] = pd.to_numeric(merged["InitialDeposit"], errors="coerce").fillna(0.0)
-
-    # Per-QuoteID raw sum of collections
     raw_sum = merged.groupby("QuoteID")["DepositPaid"].sum()
-
-    # Is there (at least) one collections row that equals the initial? -> legacy duplicate
     has_legacy = (
         (merged["DepositPaid"].round(2) == merged["InitialDeposit"].round(2))
         .groupby(merged["QuoteID"])
         .any()
     )
-
-    # Adjust collections sum: subtract initial once if a legacy duplicate exists
     initial_map = s.set_index("QuoteID")["DepositPaid"]
     adj_sum = raw_sum - initial_map.where(has_legacy, 0.0)
     adj_sum = adj_sum.reindex(s["QuoteID"].unique(), fill_value=0.0)
-
-    # TOTAL paid to date = initial (from Sales) + adjusted collections
     total_paid = initial_map.add(adj_sum, fill_value=0.0)
-
-    # Write back to Sales and recompute %
     s = s.set_index("QuoteID")
     s.loc[total_paid.index, "DepositPaid"] = total_paid.values
     s["Deposit%"] = s.apply(
@@ -208,6 +225,13 @@ def update_balance_due(sales: pd.DataFrame, collections: pd.DataFrame) -> pd.Dat
 
 
 # ---------------- Utils ----------------
+# UI display formatting helpers (keep numbers numeric in memory)
+def _fmt_currency_series(s):
+    return s.apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else "")
+
+def _fmt_percent_series(s):  # NEW: show 20 -> "20.00%"
+    return s.apply(lambda x: f"{float(x):.2f}%" if pd.notnull(x) else "")
+
 # Generate unique QuoteID based on area (Toms River or Manahawkin)
 def generate_unique_quote_id(area, sales):
     area = (area or "").strip()
@@ -538,7 +562,17 @@ if page == "Sales Log":
     st.subheader("All Sales Entries")
     st.caption(f"Rows in Sales (after load): {len(sales)}")
 
-    st.dataframe(sales)
+    # Display-only formatting: $ for money, date-only, % for Deposit%
+    display_sales = sales.copy()
+    for money_col in ("QuotedPrice", "DepositPaid"):
+        if money_col in display_sales.columns:
+            display_sales[money_col] = _fmt_currency_series(pd.to_numeric(display_sales[money_col], errors="coerce"))
+    if "Deposit%" in display_sales.columns:
+        display_sales["Deposit%"] = _fmt_percent_series(pd.to_numeric(display_sales["Deposit%"], errors="coerce"))
+    for date_col in ("StartDate", "EndDate"):
+        if date_col in display_sales.columns and pd.api.types.is_datetime64_any_dtype(display_sales[date_col]):
+            display_sales[date_col] = display_sales[date_col].dt.date
+    st.dataframe(display_sales)
 
 # ---------------- Collections ----------------
 
@@ -552,7 +586,10 @@ elif page == "Collections":
         add_another = st.radio("Would you like to add another collection?", ["No", "Yes"], index=0)
         if add_another == "No":
             st.subheader("All Collections Data")
-            collections_display = collections.drop(columns=["DepositDue"], errors="ignore")
+            collections_display = collections.drop(columns=["DepositDue"], errors="ignore").copy()
+            for money_col in ("DepositPaid", "BalanceDue"):
+                if money_col in collections_display.columns:
+                    collections_display[money_col] = _fmt_currency_series(pd.to_numeric(collections_display[money_col], errors="coerce"))
             cols = [c for c in ["QuoteID","Client","DepositPaid","BalanceDue","Status"] if c in collections_display.columns]
             st.dataframe(collections_display[cols] if cols else collections_display)
             st.session_state["collection_added_quote"] = None
@@ -596,11 +633,20 @@ elif page == "Collections":
         c3.metric("Balance Due", f"${remaining_balance_due:,.2f}")
         st.caption(f"Collections ledger sum: ${coll_history['DepositPaid'].sum():,.2f} • Status: {pay_status}")
 
-        # Sales info
+        # Sales info (display-only formatting for $, date-only, and %)
         st.markdown("#### Sales Info")
         if not sales_row.empty:
             sales_view_cols = [c for c in ["QuoteID","Client","QuotedPrice","Status","SalesRep","Deposit%","DepositPaid","StartDate","EndDate","JobType"] if c in sales_row.columns]
-            st.dataframe(sales_row[sales_view_cols])
+            display_sales_row = sales_row.copy()
+            for money_col in ("QuotedPrice", "DepositPaid"):
+                if money_col in display_sales_row.columns:
+                    display_sales_row[money_col] = _fmt_currency_series(pd.to_numeric(display_sales_row[money_col], errors="coerce"))
+            if "Deposit%" in display_sales_row.columns:
+                display_sales_row["Deposit%"] = _fmt_percent_series(pd.to_numeric(display_sales_row["Deposit%"], errors="coerce"))
+            for date_col in ("StartDate", "EndDate"):
+                if date_col in display_sales_row.columns and pd.api.types.is_datetime64_any_dtype(display_sales_row[date_col]):
+                    display_sales_row[date_col] = display_sales_row[date_col].dt.date
+            st.dataframe(display_sales_row[sales_view_cols])
         else:
             st.info("No Sales row found for this Quote ID.")
 
@@ -616,6 +662,10 @@ elif page == "Collections":
             cols_display = [c for c in ["QuoteID","Client","DepositPaid","Status","BalanceDue",
                                         "RunningTotal","TotalPaidAfterThis","BalanceAfterThis"]
                             if c in coll_history.columns or c in ["RunningTotal","TotalPaidAfterThis","BalanceAfterThis"]]
+            # format money columns for display
+            for money_col in ("DepositPaid", "BalanceDue", "RunningTotal", "TotalPaidAfterThis", "BalanceAfterThis"):
+                if money_col in coll_history.columns:
+                    coll_history[money_col] = _fmt_currency_series(pd.to_numeric(coll_history[money_col], errors="coerce"))
             st.dataframe(coll_history[cols_display])
         else:
             st.info("No collections for this Quote ID yet.")
@@ -661,7 +711,10 @@ elif page == "Collections":
 
     # Always show all collections (without DepositDue)
     st.subheader("All Collections Data")
-    collections_display = collections.drop(columns=["DepositDue"], errors="ignore")
+    collections_display = collections.drop(columns=["DepositDue"], errors="ignore").copy()
+    for money_col in ("DepositPaid", "BalanceDue"):
+        if money_col in collections_display.columns:
+            collections_display[money_col] = _fmt_currency_series(pd.to_numeric(collections_display[money_col], errors="coerce"))
     cols = [c for c in ["QuoteID","Client","DepositPaid","BalanceDue","Status"] if c in collections_display.columns]
     st.dataframe(collections_display[cols] if cols else collections_display)
 
@@ -673,7 +726,7 @@ elif page == "Assignments":
     # ---- Assigned and Pending Tasks KPI ----
     assigned_tasks = assignments["QuoteID"].unique() if "QuoteID" in assignments.columns else []
     won_sales = sales[sales["Status"] == "Won"] if "Status" in sales.columns else sales.iloc[0:0]
-    pending_tasks = [quote_id for quote_id in won_sales["QuoteID"]] if "QuoteID" in won_sales.columns else []
+    pending_tasks = [quote_id for quote_id in won_sales["QuoteID"]] if "QuoteID" in sales.columns else []
     pending_tasks = [qid for qid in pending_tasks if qid not in assigned_tasks]
 
     col1, col2 = st.columns(2)
@@ -728,6 +781,7 @@ elif page == "Assignments":
             start_date = st.date_input("Start Date")
             end_date = st.date_input("End Date")
             payment = st.number_input("Crew Payment", min_value=0.0, format="%.2f")
+            notes = st.text_area("Notes")  # NEW: Notes input
 
             days_taken = (end_date - start_date).days if end_date and start_date else 0
             st.text(f"Days Taken: {days_taken} days")
@@ -747,7 +801,8 @@ elif page == "Assignments":
                         "StartDate": start_date,
                         "EndDate": end_date,
                         "Payment": payment,
-                        "DaysTaken": days_taken
+                        "DaysTaken": days_taken,
+                        "Notes": notes,  # NEW: persist notes
                     }
 
                     assignments = pd.concat([assignments, pd.DataFrame([new_assignment])], ignore_index=True)
