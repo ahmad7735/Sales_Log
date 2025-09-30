@@ -9,7 +9,10 @@ import tempfile
 
 # File path
 EXCEL_FILE = "data.xlsx"
-import os
+# Defaults to satisfy static analyzer; real values set in each page’s UI
+selected_rep = "All"
+start_date = end_date = None
+
 
 # ---------------- Data IO ----------------
 # Removing @st.cache_data to avoid caching issues
@@ -17,21 +20,36 @@ def load_data():
     sales = pd.read_excel(EXCEL_FILE, sheet_name="SalesLog")
     collections = pd.read_excel(EXCEL_FILE, sheet_name="Collections")
     assignments = pd.read_excel(EXCEL_FILE, sheet_name="Assignments")
+    # after: assignments = pd.read_excel(EXCEL_FILE, sheet_name="Assignments")
+
+    # Make sure we have Completed (bool) and TaskStatus (str)
+    if "Completed" not in assignments.columns:
+        assignments["Completed"] = False
+    else:
+        assignments["Completed"] = assignments["Completed"].astype(bool)
+
+    if "TaskStatus" not in assignments.columns:
+        # default to "Not started" for open rows, "Completed" for completed rows
+        assignments["TaskStatus"] = assignments["Completed"].map(lambda x: "Completed" if x else "Not started")
+    else:
+        assignments["TaskStatus"] = assignments["TaskStatus"].astype(str)
+
+    # NEW: guarantee + normalize the CollectionDate column
+    if "CollectionDate" not in collections.columns:
+        collections["CollectionDate"] = pd.NaT
+    else:
+        collections["CollectionDate"] = pd.to_datetime(collections["CollectionDate"], errors="coerce")
 
     # Ensure numeric
     sales["QuotedPrice"] = pd.to_numeric(sales.get("QuotedPrice", 0), errors="coerce").fillna(0)
     sales["DepositPaid"] = pd.to_numeric(sales.get("DepositPaid", 0), errors="coerce").fillna(0)
-
-    # Ensure collections fields are numeric
     collections["QuoteID"] = pd.to_numeric(collections.get("QuoteID", 0), errors="coerce")
     collections["DepositPaid"] = pd.to_numeric(collections.get("DepositPaid", 0), errors="coerce").fillna(0)
 
     # Ensure dates
-    if "StartDate" in sales.columns:
-        sales["StartDate"] = pd.to_datetime(sales["StartDate"], errors="coerce")
-    if "EndDate" in sales.columns:
-        sales["EndDate"] = pd.to_datetime(sales["EndDate"], errors="coerce")
-
+    if "SentDate" in sales.columns:
+        sales["SentDate"] = pd.to_datetime(sales["SentDate"], errors="coerce")
+        
     # Ensure QuoteID column exists
     if "QuoteID" not in sales.columns:
         sales["QuoteID"] = pd.Series(dtype="int")
@@ -52,9 +70,9 @@ def load_data():
 
 def save_data(sales, collections, assignments):
     SALES_ORDER = ["QuoteID", "Client", "QuotedPrice", "Status", "SalesRep",
-                   "Deposit%", "DepositPaid", "StartDate", "EndDate", "JobType"]
+                   "Deposit%", "DepositPaid", "SentDate", "JobType"]
     # No DepositDue here ✅
-    COLLECTIONS_ORDER = ["QuoteID", "Client", "DepositPaid", "BalanceDue", "Status"]
+    COLLECTIONS_ORDER = ["QuoteID", "CollectionDate", "Client", "DepositPaid", "BalanceDue", "Status"]
 
     # Normalize key columns
     for df in (sales, collections, assignments):
@@ -120,13 +138,15 @@ def save_data(sales, collections, assignments):
             # SalesLog: $ for money, date-only for dates, literal % for Deposit%
             format_column(ws_sales, sales_to_save, "QuotedPrice", currency_fmt)
             format_column(ws_sales, sales_to_save, "DepositPaid", currency_fmt)
-            format_column(ws_sales, sales_to_save, "StartDate", date_fmt)
-            format_column(ws_sales, sales_to_save, "EndDate", date_fmt)
+            format_column(ws_sales, sales_to_save, "SentDate", date_fmt)
             format_column(ws_sales, sales_to_save, "Deposit%", percent_literal_fmt)
 
             # Collections: $ for money
             format_column(ws_col, collections_to_save, "DepositPaid", currency_fmt)
             format_column(ws_col, collections_to_save, "BalanceDue", currency_fmt)
+            format_column(ws_col, collections_to_save, "CollectionDate", date_fmt)
+
+            
 
         os.replace(tmp_path, os.path.abspath(EXCEL_FILE))  # atomic replace
         return True
@@ -143,6 +163,86 @@ def save_data(sales, collections, assignments):
 
 
 # ---------------- Derivations ----------------
+def build_filters_ui(df: pd.DataFrame, key_prefix: str, date_col: str = "SentDate"):
+    """Render sidebar filters and return (filtered_df, selected_rep, start_date, end_date)."""
+    st.sidebar.subheader("Filters")
+    selected_rep, start_date, end_date = "All", None, None
+
+    # Sales Rep
+    reps = ["All"]
+    if "SalesRep" in df.columns:
+        reps += sorted(df["SalesRep"].dropna().unique().tolist())
+    selected_rep = st.sidebar.selectbox("Sales Rep", reps, key=f"{key_prefix}_rep")
+
+    # Date + Quick Range (based on date_col)
+    if date_col in df.columns and pd.api.types.is_datetime64_any_dtype(df[date_col]):
+        valid_dates = df[date_col].dropna()
+        if not valid_dates.empty:
+            min_date = valid_dates.min().date()
+            max_date = valid_dates.max().date()
+
+            picked = st.sidebar.date_input(
+                "Select Date Range", [min_date, max_date], key=f"{key_prefix}_date_range"
+            )
+            quick = st.sidebar.selectbox(
+                "Quick Range",
+                ["Choose Quick Range", "Last 7 days", "Last 30 days", "Last 90 days",
+                 "This month (MTD)", "Last month", "Year to date (YTD)"],
+                index=0, key=f"{key_prefix}_quick"
+            )
+
+            today = pd.Timestamp.today().normalize()
+            first_this_month = today.replace(day=1)
+
+            if quick == "Last 7 days":
+                start_date, end_date = (today - pd.Timedelta(days=7)).date(), today.date()
+            elif quick == "Last 30 days":
+                start_date, end_date = (today - pd.Timedelta(days=30)).date(), today.date()
+            elif quick == "Last 90 days":
+                start_date, end_date = (today - pd.Timedelta(days=90)).date(), today.date()
+            elif quick == "This month (MTD)":
+                start_date, end_date = first_this_month.date(), today.date()
+            elif quick == "Last month":
+                last_month_end = first_this_month - pd.Timedelta(days=1)
+                start_date, end_date = last_month_end.replace(day=1).date(), last_month_end.date()
+            elif quick == "Year to date (YTD)":
+                start_date, end_date = pd.Timestamp(today.year, 1, 1).date(), today.date()
+            else:
+                if isinstance(picked, list) and len(picked) == 2:
+                    start_date, end_date = picked
+
+    # Apply filters
+    filtered = df.copy()
+    if selected_rep != "All" and "SalesRep" in filtered.columns:
+        filtered = filtered[filtered["SalesRep"] == selected_rep]
+    if start_date and end_date and date_col in filtered.columns:
+        filtered = filtered[
+            (filtered[date_col] >= pd.to_datetime(start_date)) &
+            (filtered[date_col] <= pd.to_datetime(end_date))
+        ]
+
+    # Save in session for reuse after mid-page reloads
+    st.session_state[f"{key_prefix}_filters"] = {"rep": selected_rep, "start": start_date, "end": end_date}
+    return filtered, selected_rep, start_date, end_date
+
+
+def apply_saved_filters(df: pd.DataFrame, key_prefix: str, date_col: str = "SentDate"):
+    """Re-apply the last chosen filters without re-rendering the sidebar UI."""
+    state = st.session_state.get(f"{key_prefix}_filters", {})
+    selected_rep = state.get("rep", "All")
+    start_date   = state.get("start")
+    end_date     = state.get("end")
+
+    filtered = df.copy()
+    if selected_rep != "All" and "SalesRep" in filtered.columns:
+        filtered = filtered[filtered["SalesRep"] == selected_rep]
+    if start_date and end_date and date_col in filtered.columns:
+        filtered = filtered[
+            (filtered[date_col] >= pd.to_datetime(start_date)) &
+            (filtered[date_col] <= pd.to_datetime(end_date))
+        ]
+    return filtered
+
 def sync_deposit_paid(sales: pd.DataFrame, collections: pd.DataFrame) -> pd.DataFrame:
     """
     Make Sales.DepositPaid = SUM(Collections.DepositPaid) per QuoteID.
@@ -226,6 +326,22 @@ def update_balance_due(sales: pd.DataFrame, collections: pd.DataFrame) -> pd.Dat
 
 # ---------------- Utils ----------------
 # UI display formatting helpers (keep numbers numeric in memory)
+def _to_datetime_if_present(df: pd.DataFrame, cols):
+    """Coerce the given columns to datetime (in-place-friendly), if they exist."""
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
+
+def _to_numeric_if_present(df: pd.DataFrame, cols):
+    """Coerce the given columns to numeric (in-place-friendly), if they exist."""
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
 def _fmt_currency_series(s):
     return s.apply(lambda x: f"${x:,.2f}" if pd.notnull(x) else "")
 
@@ -257,6 +373,27 @@ def safe_rerun():
     except Exception:
         st.session_state["force_rerun"] = not st.session_state.get("force_rerun", False)
         st.stop()
+        
+        # ---------- Inline table editing helpers ----------
+
+def _to_datetime_if_present(df, cols):
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+    return df
+
+def _update_base_by_rowid(base_df: pd.DataFrame, edited_view: pd.DataFrame, cols_to_update, rowid_col="RowID"):
+    """
+    Push edited values (by row index) back into the original DataFrame.
+    'RowID' must be the original base_df index captured before editing.
+    """
+    updated = base_df.copy()
+    e = edited_view.set_index(rowid_col)
+    shared = [c for c in cols_to_update if c in updated.columns and c in e.columns]
+    updated.loc[e.index, shared] = e[shared]
+    return updated
+
 
 # ---------------- App boot ----------------
 # Load data initially
@@ -274,41 +411,14 @@ page = st.sidebar.radio("Select Page", ["Dashboard", "Sales Log", "Collections",
 # ---------------- Dashboard ----------------
 if page == "Dashboard":
     st.title("📊 Dashboard")
+    st.markdown("Here you can review a Quick snapshot of KPIs, Revenue/Payment charts, and Task status.")
+    
 
     # ---- Filters ----
-    st.sidebar.subheader("Filters")
+    # Replace your dashboard filter block with:
+    filtered_sales, dash_rep, dash_start, dash_end = build_filters_ui(sales, "dash")
+    # ...then keep using `filtered_sales` exactly like before
 
-    # Sales Rep Filter
-    reps = ["All"]
-    if "SalesRep" in sales.columns:
-        reps += sorted(sales["SalesRep"].dropna().unique().tolist())
-    selected_rep = st.sidebar.selectbox("Select Sales Rep", reps)
-
-    # Date Range Filter
-    if "StartDate" in sales.columns and pd.api.types.is_datetime64_any_dtype(sales["StartDate"]):
-        valid_dates = sales["StartDate"].dropna()
-        if not valid_dates.empty:
-            min_date = valid_dates.min().date()
-            max_date = valid_dates.max().date()
-            date_range = st.sidebar.date_input("Select Date Range", [min_date, max_date])
-            if isinstance(date_range, list) and len(date_range) == 2:
-                start_date, end_date = date_range
-            else:
-                start_date, end_date = min_date, max_date
-        else:
-            start_date, end_date = None, None
-    else:
-        start_date, end_date = None, None
-
-    # Apply Filters
-    filtered_sales = sales.copy()
-    if selected_rep != "All" and "SalesRep" in filtered_sales.columns:
-        filtered_sales = filtered_sales[filtered_sales["SalesRep"] == selected_rep]
-    if start_date and end_date and "StartDate" in filtered_sales.columns:
-        filtered_sales = filtered_sales[
-            (filtered_sales["StartDate"] >= pd.to_datetime(start_date)) &
-            (filtered_sales["StartDate"] <= pd.to_datetime(end_date))
-        ]
 
     # ---- Won-only view (copy to avoid SettingWithCopy warnings) ----
     if "Status" in filtered_sales.columns:
@@ -335,10 +445,10 @@ if page == "Dashboard":
         # Reapply filters if those vars exist
         if 'selected_rep' in locals() and selected_rep != "All" and "SalesRep" in filtered_sales.columns:
             filtered_sales = filtered_sales[filtered_sales["SalesRep"] == selected_rep]
-        if 'start_date' in locals() and 'end_date' in locals() and start_date and end_date and "StartDate" in filtered_sales.columns:
+        if 'start_date' in locals() and 'end_date' in locals() and start_date and end_date and "SentDate" in filtered_sales.columns:
             filtered_sales = filtered_sales[
-                (filtered_sales["StartDate"] >= pd.to_datetime(start_date)) &
-                (filtered_sales["StartDate"] <= pd.to_datetime(end_date))
+                (filtered_sales["SentDate"] >= pd.to_datetime(start_date)) &
+                (filtered_sales["SentDate"] <= pd.to_datetime(end_date))
             ]
 
     # Ensure won_sales and filtered_collections exist
@@ -430,7 +540,7 @@ if page == "Dashboard":
             fig2, ax2 = plt.subplots()
             pd.Series(payments_data).plot(kind="bar", ax=ax2, color=["blue", "green", "purple"])
             pct_labels = {k: (v / total_payments * 100) for k, v in payments_data.items()}
-            ax2.set_title("Payments Tracking (Won Jobs Only)")
+            ax2.set_title("Payments Tracking")
             ax2.set_xticklabels([f"{k} ({v:.1f}%)" for k, v in pct_labels.items()], rotation=45)
             st.pyplot(fig2)
         else:
@@ -450,7 +560,7 @@ if page == "Dashboard":
 
     fig3, ax3 = plt.subplots()
     ax3.bar(["Assigned", "Pending"], [len(assigned_tasks), len(pending_tasks)], color=["green", "red"])
-    ax3.set_title("Assigned vs Pending Tasks (Won Jobs Only)")
+    ax3.set_title("Assigned vs Pending Tasks")
     ax3.set_ylabel("Number of Tasks")
     st.pyplot(fig3)
 
@@ -459,6 +569,9 @@ if page == "Dashboard":
 # ---------------- Sales Log ----------------
 if page == "Sales Log":
     st.title("📝 Sales Log")
+    st.markdown("Here you can add New Sales & review Existing Sales.")
+    # Right after the title/markdown:
+    sl_filtered_sales, sl_rep, sl_start, sl_end = build_filters_ui(sales, "sl")
 
     # Initialize session state inputs if not present
     if "quoted_price_input" not in st.session_state:
@@ -485,24 +598,25 @@ if page == "Sales Log":
 
     # If no sale added or user selected "Yes" to add another
     if st.session_state.get("sale_added") is None:
-        quoted_price = st.number_input("Quoted Price *", min_value=0.0, format="%.2f", key="quoted_price_input")
-        deposit_paid = st.number_input("Deposit Paid *", min_value=0.0, format="%.2f", key="deposit_paid_input")
-
-        if quoted_price > 0:
-            deposit_pct = round((deposit_paid / quoted_price) * 100, 2)
-        else:
-            deposit_pct = 0.0
-
-        st.text(f"Deposit %: {deposit_pct:.2f}%")
-
         with st.form("add_sale"):
             st.subheader("Add New Sale")
             area = st.selectbox("Area *", ["Toms River", "Manahawkin"])
+
+            # 👇 moved inside the form, right after Area
+            quoted_price = st.number_input("Quoted Price *", min_value=0.0, format="%.2f", key="quoted_price_input")
+            deposit_paid = st.number_input("Deposit Paid *", min_value=0.0, format="%.2f", key="deposit_paid_input")
+            deposit_pct_preview = round((deposit_paid / quoted_price) * 100, 2) if quoted_price > 0 else 0.0
+            st.caption(f"Deposit %: {deposit_pct_preview:.2f}%")
+
             client = st.text_input("Client *")
             status = st.selectbox("Status *", ["Sent", "Won", "Lost"])
             sales_rep = st.text_input("Sales Rep *")
-            start_date = st.date_input("Start Date *")
-            end_date = st.date_input("End Date *")
+
+            # 👇 rename Start Date → Sent Date
+            sent_date = st.date_input("Sent Date *")
+
+            # 👇 removed End Date input
+
             job_type = st.text_input("Job Type *")
 
             submitted = st.form_submit_button("Add Sale")
@@ -528,16 +642,16 @@ if page == "Sales Log":
                         "SalesRep": sales_rep,
                         "Deposit%": deposit_pct,
                         "DepositPaid": deposit_paid_val,   # initial value; sync may overwrite from Collections
-                        "StartDate": start_date,
-                        "EndDate": end_date,
+                        "SentDate": sent_date,            # renamed in UI                                               
                         "JobType": job_type
                     }
                     sales = pd.concat([sales, pd.DataFrame([new_row])], ignore_index=True)
-                    
+
                     # 3) If there is an initial deposit, insert a matching Collections row
                     if deposit_paid_val and deposit_paid_val > 0:
                         collections = pd.concat([collections, pd.DataFrame([{
                             "QuoteID": new_id,
+                            "CollectionDate": sent_date, 
                             "Client": client,
                             "DepositDue": max(quoted_price_val - deposit_paid_val, 0.0),
                             "DepositPaid": deposit_paid_val,
@@ -557,28 +671,59 @@ if page == "Sales Log":
                     else:
                         st.stop()
 
-
     # Always show all sales at the bottom
     st.subheader("All Sales Entries")
-    st.caption(f"Rows in Sales (after load): {len(sales)}")
+    st.caption(f"Rows shown (filtered): {len(sl_filtered_sales)}")
 
-    # Display-only formatting: $ for money, date-only, % for Deposit%
-    display_sales = sales.copy()
-    for money_col in ("QuotedPrice", "DepositPaid"):
-        if money_col in display_sales.columns:
-            display_sales[money_col] = _fmt_currency_series(pd.to_numeric(display_sales[money_col], errors="coerce"))
-    if "Deposit%" in display_sales.columns:
-        display_sales["Deposit%"] = _fmt_percent_series(pd.to_numeric(display_sales["Deposit%"], errors="coerce"))
-    for date_col in ("StartDate", "EndDate"):
-        if date_col in display_sales.columns and pd.api.types.is_datetime64_any_dtype(display_sales[date_col]):
-            display_sales[date_col] = display_sales[date_col].dt.date
-    st.dataframe(display_sales)
+    # Build an edit view using the *base* DataFrame rows so RowID == original index
+    sales_edit_idx = sl_filtered_sales.index
+    sl_edit_view = sales.loc[sales_edit_idx, ["QuoteID", "Client", "SalesRep", "SentDate", "Status", "JobType", "QuotedPrice"]].copy()
+    sl_edit_view.insert(0, "RowID", sl_edit_view.index)  # stable key for writing back
 
-# ---------------- Collections ----------------
+    # Nice editing UX (keeps real dtypes; number/date formats only for UI)
+    edited_sl = st.data_editor(
+    sl_edit_view,
+    key="editor_sales",
+    num_rows="fixed",
+    disabled=["RowID", "QuoteID"],
+    column_config={
+        "QuotedPrice": st.column_config.NumberColumn("Quoted Price", format="$%.2f"),
+        "SentDate": st.column_config.DateColumn("Sent Date"),
+    },
+    use_container_width=True,
+    hide_index=True,   # 👈 add this
+)
+
+
+    if st.button("Save Sales Table Edits", key="save_sales"):
+        # Ensure date types are correct before writing back
+        edited_sl = _to_datetime_if_present(edited_sl, ["SentDate"])
+
+        # Push edits back to base `sales` for selected rows/cols
+        sales = _update_base_by_rowid(
+            sales, edited_sl,
+            cols_to_update=["Client", "SalesRep", "SentDate", "Status", "JobType", "QuotedPrice"]
+        )
+
+        # Recompute derived fields and persist
+        sales = sync_deposit_paid(sales, collections)
+        collections = update_balance_due(sales, collections)
+        if save_data(sales, collections, assignments):
+            st.success("Sales updated.")
+            st.rerun()
+        else:
+            st.stop()
+
+   
+
 
 # ---------------- Collections ----------------
 elif page == "Collections":
     st.title("💰 Collections")
+    st.markdown("Search a Quote ID to log follow-up payments and view the live balance due.")
+    col_filtered_sales, col_rep, col_start, col_end = build_filters_ui(sales, "col")
+    # Won list source:
+    won_sales = col_filtered_sales[col_filtered_sales["Status"] == "Won"]
 
     # Success banner after adding a collection
     if "collection_added_quote" in st.session_state and st.session_state["collection_added_quote"] is not None:
@@ -598,14 +743,26 @@ elif page == "Collections":
             st.session_state["collection_added_quote"] = None
             st.session_state.pop("collection_submitted", None)
 
-    # WON jobs only
-    won_sales = sales[sales["Status"] == "Won"]
-    options = ["Select a QuoteID or Client"] + [
-        f"{int(row['QuoteID'])} - {row['Client']}" for _, row in won_sales.iterrows()
-    ]
-    selected = st.selectbox("Search QuoteID or Client", options, index=0)
+    # WON jobs only (from the filtered Sales)
+    won_sales = col_filtered_sales[col_filtered_sales["Status"] == "Won"]
 
-    if selected != "Select a QuoteID or Client":
+
+    # Build the real options only (no dummy first item)
+    options = [
+        f"{int(row['QuoteID'])} - {row['Client']}"
+        for _, row in won_sales.iterrows()
+    ]
+
+    # Show only a placeholder in the UI until a value is chosen
+    selected = st.selectbox(
+        "",  # no visible label
+        options,
+        index=None,  # nothing preselected
+        placeholder="Search QuoteID or Client",
+        label_visibility="collapsed",
+    )
+
+    if selected:
         selected_quote_id = int(selected.split(" - ")[0])
 
         # Base info
@@ -632,50 +789,11 @@ elif page == "Collections":
         c2.metric("Paid To Date", f"${paid_to_date:,.2f}")
         c3.metric("Balance Due", f"${remaining_balance_due:,.2f}")
         st.caption(f"Collections ledger sum: ${coll_history['DepositPaid'].sum():,.2f} • Status: {pay_status}")
-
-        # Sales info (display-only formatting for $, date-only, and %)
-        st.markdown("#### Sales Info")
-        if not sales_row.empty:
-            sales_view_cols = [c for c in ["QuoteID","Client","QuotedPrice","Status","SalesRep","Deposit%","DepositPaid","StartDate","EndDate","JobType"] if c in sales_row.columns]
-            display_sales_row = sales_row.copy()
-            for money_col in ("QuotedPrice", "DepositPaid"):
-                if money_col in display_sales_row.columns:
-                    display_sales_row[money_col] = _fmt_currency_series(pd.to_numeric(display_sales_row[money_col], errors="coerce"))
-            if "Deposit%" in display_sales_row.columns:
-                display_sales_row["Deposit%"] = _fmt_percent_series(pd.to_numeric(display_sales_row["Deposit%"], errors="coerce"))
-            for date_col in ("StartDate", "EndDate"):
-                if date_col in display_sales_row.columns and pd.api.types.is_datetime64_any_dtype(display_sales_row[date_col]):
-                    display_sales_row[date_col] = display_sales_row[date_col].dt.date
-            st.dataframe(display_sales_row[sales_view_cols])
-        else:
-            st.info("No Sales row found for this Quote ID.")
-
-        # Collections history table with running totals aligned to the Sales total
-        st.markdown("#### Collections History")
-        if not coll_history.empty:
-            base_offset = max(0.0, paid_to_date - coll_history["DepositPaid"].sum())  # covers case where initial deposit isn't in Collections
-            coll_history = coll_history.copy()
-            coll_history["RunningTotal"] = coll_history["DepositPaid"].cumsum()
-            coll_history["TotalPaidAfterThis"] = (base_offset + coll_history["RunningTotal"]).clip(upper=quoted_price)
-            coll_history["BalanceAfterThis"] = (quoted_price - coll_history["TotalPaidAfterThis"]).clip(lower=0.0)
-
-            cols_display = [c for c in ["QuoteID","Client","DepositPaid","Status","BalanceDue",
-                                        "RunningTotal","TotalPaidAfterThis","BalanceAfterThis"]
-                            if c in coll_history.columns or c in ["RunningTotal","TotalPaidAfterThis","BalanceAfterThis"]]
-            # format money columns for display
-            for money_col in ("DepositPaid", "BalanceDue", "RunningTotal", "TotalPaidAfterThis", "BalanceAfterThis"):
-                if money_col in coll_history.columns:
-                    coll_history[money_col] = _fmt_currency_series(pd.to_numeric(coll_history[money_col], errors="coerce"))
-            st.dataframe(coll_history[cols_display])
-        else:
-            st.info("No collections for this Quote ID yet.")
-
-        st.markdown("---")
-
         # Add new collection
         with st.form("update_collection"):
-            st.write(f"Remaining Balance Due (before this collection): **${remaining_balance_due:,.2f}**")
-
+            st.subheader("Add New Collection")
+            st.write(f"Remaining Balance Due: **${remaining_balance_due:,.2f}**")
+            collection_date = st.date_input("Collection Date", value=pd.Timestamp.today().date())
             deposit_paid_input = st.number_input("New Collection Amount", value=0.0, min_value=0.0, format="%.2f")
             status_options = ["Pending", "Partially Paid", "Paid", "Overdue"]
             if not coll_history.empty and str(coll_history["Status"].iloc[-1]) in status_options:
@@ -694,6 +812,7 @@ elif page == "Collections":
                 else:
                     new_row = {
                         "QuoteID": selected_quote_id,
+                        "CollectionDate": collection_date,
                         "Client": client_name,
                         "DepositPaid": float(deposit_paid_input),
                         "Status": status_input,
@@ -708,71 +827,173 @@ elif page == "Collections":
                         safe_rerun()
                     else:
                         st.stop()
+        # Sales info (display-only formatting for $, date-only, and %)
+        st.markdown("#### Sales Info")
+        if not sales_row.empty:
+            sales_view_cols = [c for c in ["QuoteID","Client","QuotedPrice","Status","SalesRep","Deposit%","DepositPaid","SentDate","JobType"] if c in sales_row.columns]
+            display_sales_row = sales_row.copy()
+            for money_col in ("QuotedPrice", "DepositPaid"):
+                if money_col in display_sales_row.columns:
+                    display_sales_row[money_col] = _fmt_currency_series(pd.to_numeric(display_sales_row[money_col], errors="coerce"))
+            if "Deposit%" in display_sales_row.columns:
+                display_sales_row["Deposit%"] = _fmt_percent_series(pd.to_numeric(display_sales_row["Deposit%"], errors="coerce"))
+            for date_col in ("SentDate"):
+                if date_col in display_sales_row.columns and pd.api.types.is_datetime64_any_dtype(display_sales_row[date_col]):
+                    display_sales_row[date_col] = display_sales_row[date_col].dt.date
+            st.dataframe(display_sales_row[sales_view_cols])
+        else:
+            st.info("No Sales row found for this Quote ID.")
+        
+        # Collections history table with running totals aligned to the Sales total
+        st.markdown("#### Collections History")
+        if not coll_history.empty:
+            base_offset = max(0.0, paid_to_date - coll_history["DepositPaid"].sum())  # covers case where initial deposit isn't in Collections
+            coll_history = coll_history.copy()
+            coll_history["RunningTotal"] = coll_history["DepositPaid"].cumsum()
+            coll_history["TotalPaidAfterThis"] = (base_offset + coll_history["RunningTotal"]).clip(upper=quoted_price)
+            coll_history["BalanceAfterThis"] = (quoted_price - coll_history["TotalPaidAfterThis"]).clip(lower=0.0)
 
-    # Always show all collections (without DepositDue)
+            cols_display = [c for c in ["QuoteID","Client","DepositPaid","Status","BalanceDue",
+                                        "RunningTotal","TotalPaidAfterThis","BalanceAfterThis"]
+                            if c in coll_history.columns or c in ["RunningTotal","TotalPaidAfterThis","BalanceAfterThis"]]
+            # format money columns for display
+            for money_col in ("DepositPaid", "BalanceDue", "RunningTotal", "TotalPaidAfterThis", "BalanceAfterThis"):
+                if money_col in coll_history.columns:
+                    coll_history[money_col] = _fmt_currency_series(pd.to_numeric(coll_history[money_col], errors="coerce"))
+                    # choose columns (include CollectionDate)
+            cols_display = [c for c in ["QuoteID", "CollectionDate", "Client","DepositPaid","Status","BalanceDue",
+                                        "RunningTotal","TotalPaidAfterThis","BalanceAfterThis"]
+                            if c in coll_history.columns or c in ["RunningTotal","TotalPaidAfterThis","BalanceAfterThis"]]
+
+            # format date for display
+            if "CollectionDate" in coll_history.columns and pd.api.types.is_datetime64_any_dtype(coll_history["CollectionDate"]):
+                coll_history["CollectionDate"] = coll_history["CollectionDate"].dt.date
+
+            st.dataframe(coll_history[cols_display])
+        else:
+            st.info("No collections for this Quote ID yet.")
+
+        st.markdown("---")
+
+        
+
+    # Always show all collections 
     st.subheader("All Collections Data")
-    collections_display = collections.drop(columns=["DepositDue"], errors="ignore").copy()
-    for money_col in ("DepositPaid", "BalanceDue"):
-        if money_col in collections_display.columns:
-            collections_display[money_col] = _fmt_currency_series(pd.to_numeric(collections_display[money_col], errors="coerce"))
-    cols = [c for c in ["QuoteID","Client","DepositPaid","BalanceDue","Status"] if c in collections_display.columns]
-    st.dataframe(collections_display[cols] if cols else collections_display)
+
+    # Filter to QuoteIDs present in the (filtered) won sales
+    won_ids = (
+        won_sales["QuoteID"].dropna().astype(int).unique()
+        if "QuoteID" in won_sales.columns else []
+    )
+
+    # If nothing to show, bail early with a nice message
+    if len(won_ids) == 0:
+        st.info("No rows match the current filters.")
+    else:
+        # Row subset from the *base* df so we can write back by original index
+        rows_idx = collections.index[collections["QuoteID"].isin(won_ids)]
+
+        # Build a clean edit view (RAW values, not formatted strings)
+        col_edit_view = collections.loc[
+            rows_idx,
+            ["QuoteID", "CollectionDate", "Client", "DepositPaid", "BalanceDue", "Status"]
+        ].copy()
+
+        # Add a visible, named key column (so no blank header)
+        col_edit_view.insert(0, "Row", col_edit_view.index.astype(int))
+
+        # Editor (disable derived / key columns)
+        edited_col = st.data_editor(
+            col_edit_view,
+            key="editor_collections",
+            num_rows="fixed",                                # add new rows via the form above
+            disabled=["Row", "QuoteID", "BalanceDue"],      # BalanceDue is derived
+            column_config={
+                "CollectionDate": st.column_config.DateColumn("Collection Date"),
+                "DepositPaid": st.column_config.NumberColumn("Payment", format="$%.2f"),
+                "BalanceDue": st.column_config.NumberColumn("Balance Due", format="$%.2f"),
+            },
+            use_container_width=True,
+            hide_index=True,                                # hide the unnamed pandas index
+        )
+
+        st.caption(f"Rows shown (filtered to won jobs): {len(edited_col)}")
+
+        if st.button("Save Collections Table Edits", key="save_collections"):
+            # Normalize types coming back from the editor
+            edited_col = _to_datetime_if_present(edited_col, ["CollectionDate"])
+            edited_col = _to_numeric_if_present(edited_col, ["DepositPaid"])
+
+            # Write the edited fields back to the *base* collections using the Row key
+            for _, r in edited_col.iterrows():
+                rid = int(r["Row"])
+                for c in ["CollectionDate", "Client", "DepositPaid", "Status"]:
+                    if c in collections.columns:
+                        collections.at[rid, c] = r[c]
+
+            # Recompute derived fields and persist
+            sales = sync_deposit_paid(sales, collections)
+            collections = update_balance_due(sales, collections)
+            if save_data(sales, collections, assignments):
+                st.success("Collections updated.")
+                st.rerun()
+            else:
+                st.stop()
+
+
 
 
 # ---------------- Assignments ----------------
 elif page == "Assignments":
     st.title("📋 Assignments")
+    st.markdown("Assign Pending jobs to crew, set dates/payment/notes, and track pending vs assigned.")
 
-    # ---- Assigned and Pending Tasks KPI ----
-    assigned_tasks = assignments["QuoteID"].unique() if "QuoteID" in assignments.columns else []
-    won_sales = sales[sales["Status"] == "Won"] if "Status" in sales.columns else sales.iloc[0:0]
-    pending_tasks = [quote_id for quote_id in won_sales["QuoteID"]] if "QuoteID" in sales.columns else []
-    pending_tasks = [qid for qid in pending_tasks if qid not in assigned_tasks]
+    # ---- Filters (Assignments) ----
+    asg_filtered_sales, asg_rep, asg_start, asg_end = build_filters_ui(sales, "asg")
+    won_sales = asg_filtered_sales[asg_filtered_sales["Status"] == "Won"]
 
-    col1, col2 = st.columns(2)
-    col1.metric("Assigned Tasks", len(assigned_tasks))
-    col2.metric("Pending Tasks", len(pending_tasks))
+    # ---- Sets for counts ----
+    won_ids_all = won_sales["QuoteID"].dropna().astype(int).tolist() if "QuoteID" in won_sales.columns else []
+    assigned_all_ids = set(assignments["QuoteID"].dropna().astype(int).tolist()) if "QuoteID" in assignments.columns else set()
+    pending_job_ids = [qid for qid in won_ids_all if qid not in assigned_all_ids]
 
-    # ---- Buttons to show Task Tables ----
-    if st.button("Show Assigned Tasks"):
-        assigned_task_data = assignments[assignments["QuoteID"].isin(assigned_tasks)] if "QuoteID" in assignments.columns else assignments
-        st.subheader("Assigned Tasks")
-        st.dataframe(assigned_task_data)
+    # ✅ FIX: open = NOT completed; done = completed
+    completed_series = assignments["Completed"] if "Completed" in assignments.columns else pd.Series(False, index=assignments.index)
+    asg_open_df = assignments[~completed_series].copy() if not assignments.empty else assignments.copy()
+    asg_done_df = assignments[ completed_series].copy() if not assignments.empty else assignments.copy()
 
-    if st.button("Show Pending Tasks"):
-        pending_task_data = sales[sales["QuoteID"].isin(pending_tasks)] if "QuoteID" in sales.columns else sales.iloc[0:0]
-        st.subheader("Pending Tasks")
-        st.dataframe(pending_task_data)
+    # ---- KPIs ----
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Assigned Jobs", len(asg_open_df))
+    c2.metric("Pending Jobs", len(pending_job_ids))
+    c3.metric("Completed", len(asg_done_df))
 
-    # Reload assignments (if needed)
-    sales, collections, assignments = load_data()
+    st.markdown("---")
 
-    # ---- Assign Task Form ----
+    # =================== FORM FIRST ===================
     st.subheader("Assign Tasks")
-    won_sales = sales[sales["Status"] == "Won"] if "Status" in sales.columns else sales.iloc[0:0]
 
-    if 'assigned' not in st.session_state:
+    if "assigned" not in st.session_state:
         st.session_state.assigned = False
 
     if st.session_state.assigned:
         assign_another = st.radio("Do you want to assign another task?", options=["Yes", "No"])
-        if assign_another == "No":
-            st.write("You have chosen not to assign any more tasks.")
-            st.session_state.assigned = False
-        elif assign_another == "Yes":
-            st.write("You can now assign another task.")
-            st.session_state.assigned = False
+        st.session_state.assigned = False  # reset either way
 
     if not st.session_state.assigned:
         with st.form("assign_task"):
-            options = ["Select Quote ID or Client"] + [
-                f"{row['QuoteID']} - {row['Client']}" for _, row in won_sales.iterrows()
-            ]
-            selected_option = st.selectbox("Search QuoteID or Client", options, index=0)
+            # Options from *filtered* won jobs
+            options = [f"{int(row['QuoteID'])} - {row['Client']}" for _, row in won_sales.iterrows()]
 
-            if selected_option != "Select Quote ID or Client" and "-" in selected_option:
+            selected_option = st.selectbox(
+                "", options, index=None,
+                placeholder="Search Quote ID or Client",
+                label_visibility="collapsed",
+            )
+
+            if selected_option:
                 quote_id = int(selected_option.split(" - ")[0])
-                client = selected_option.split(" - ")[1]
+                client = selected_option.split(" - ", 1)[1]
             else:
                 quote_id = None
                 client = None
@@ -781,10 +1002,12 @@ elif page == "Assignments":
             start_date = st.date_input("Start Date")
             end_date = st.date_input("End Date")
             payment = st.number_input("Crew Payment", min_value=0.0, format="%.2f")
-            notes = st.text_area("Notes")  # NEW: Notes input
+            status_choices = ["Not started", "In progress", "On hold", "Completed"]
+            task_status = st.selectbox("Task Status", status_choices, index=0)
+            notes = st.text_area("Notes")
 
             days_taken = (end_date - start_date).days if end_date and start_date else 0
-            st.text(f"Days Taken: {days_taken} days")
+            st.caption(f"Days Taken (auto): {days_taken} day(s)")
 
             submitted = st.form_submit_button("Assign Task")
 
@@ -794,6 +1017,7 @@ elif page == "Assignments":
                 elif quote_id is None:
                     st.error("⚠️ Please select a valid Quote ID or Client.")
                 else:
+                    completed_flag = (task_status == "Completed")
                     new_assignment = {
                         "QuoteID": quote_id,
                         "Client": client,
@@ -802,44 +1026,223 @@ elif page == "Assignments":
                         "EndDate": end_date,
                         "Payment": payment,
                         "DaysTaken": days_taken,
-                        "Notes": notes,  # NEW: persist notes
+                        "Notes": notes,
+                        "Completed": completed_flag,
+                        "TaskStatus": task_status,
                     }
-
                     assignments = pd.concat([assignments, pd.DataFrame([new_assignment])], ignore_index=True)
-                    save_data(sales, collections, assignments)
 
-                    st.success(f"Task assigned to {crew_member} for Quote ID {quote_id} successfully!")
+                    if save_data(sales, collections, assignments):
+                        st.success(f"Task assigned to {crew_member} for Quote ID {quote_id}.")
+                        st.session_state.assigned = True
+                        safe_rerun()
+                    else:
+                        st.stop()
 
-                    sales, collections, assignments = load_data()
-                    st.session_state.assigned = True
-                    st.subheader("Updated Assignments")
-                    # Hide Client column if present
-                    assignments_display = assignments.drop(columns=["Client"]) if "Client" in assignments.columns else assignments
-                    st.dataframe(assignments_display)
-                    safe_rerun()
+    st.markdown("---")
+
+    # =================== TABS (Tables) ===================
+    tab_pending, tab_assigned, tab_completed, tab_all = st.tabs(["Pending Jobs", "Assigned Jobs", "Completed", "All Assignments"])
+
+    # ---- Pending Jobs
+    with tab_pending:
+        st.subheader("Pending Jobs (Not Yet Assigned)")
+        pending_jobs_df = sales[sales["QuoteID"].isin(pending_job_ids)] if "QuoteID" in sales.columns else sales.iloc[0:0]
+        if pending_jobs_df.empty:
+            st.info("No pending jobs to assign.")
+        else:
+            base_cols = ["QuoteID","Client","SalesRep","SentDate","QuotedPrice","JobType","Status"]
+            show_cols = [c for c in base_cols if c in pending_jobs_df.columns]
+            st.dataframe(pending_jobs_df[show_cols] if show_cols else pending_jobs_df, use_container_width=True)
+
+    # ---- Assigned (Open)
+    with tab_assigned:
+        st.subheader("Assigned Jobs")
+        if asg_open_df.empty:
+            st.info("No open assignments.")
+        else:
+            edit_cols = [c for c in ["QuoteID","Client","CrewMember","StartDate","EndDate","Payment","TaskStatus","Notes","Completed"]
+                         if c in asg_open_df.columns]
+            open_edit_view = asg_open_df[edit_cols].copy()
+
+            edited_open = st.data_editor(
+                open_edit_view,
+                key="editor_assignments_open",
+                num_rows="fixed",
+                disabled=["QuoteID","Client"],
+                column_config={
+                    "StartDate": st.column_config.DateColumn("Start Date"),
+                    "EndDate": st.column_config.DateColumn("End Date"),
+                    "Payment": st.column_config.NumberColumn("Crew Payment", format="$%.2f"),
+                    "TaskStatus": st.column_config.SelectboxColumn(
+                        "Task Status",
+                        options=["Not started","In progress","On hold","Completed"],
+                    ),
+                    "Completed": st.column_config.CheckboxColumn("Completed"),
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if st.button("Save Open Assignments", key="save_assignments_open"):
+                edited_open = _to_datetime_if_present(edited_open, ["StartDate","EndDate"])
+                edited_open = _to_numeric_if_present(edited_open, ["Payment"])
+
+                for rid, row in edited_open.iterrows():
+                    for c in ["CrewMember","StartDate","EndDate","Payment","TaskStatus","Notes","Completed"]:
+                        if c in assignments.columns and c in row.index:
+                            assignments.at[rid, c] = row[c]
+                    # Sync TaskStatus with Completed
+                    if bool(assignments.at[rid, "Completed"]):
+                        assignments.at[rid, "TaskStatus"] = "Completed"
+                    elif assignments.at[rid, "TaskStatus"] == "Completed":
+                        assignments.at[rid, "TaskStatus"] = "Not started"
+
+                if {"StartDate","EndDate","DaysTaken"}.issubset(assignments.columns):
+                    sd = pd.to_datetime(assignments["StartDate"], errors="coerce")
+                    ed = pd.to_datetime(assignments["EndDate"], errors="coerce")
+                    assignments["DaysTaken"] = (ed - sd).dt.days.fillna(0).astype(int)
+
+                if save_data(sales, collections, assignments):
+                    st.success("Open assignments updated.")
+                    st.rerun()
+                else:
+                    st.stop()
+
+    # ---- Completed
+    with tab_completed:
+        st.subheader("Completed")
+        if asg_done_df.empty:
+            st.info("No completed tasks yet.")
+        else:
+            edit_cols_done = [c for c in ["QuoteID","Client","CrewMember","StartDate","EndDate","Payment","TaskStatus","Notes","Completed"]
+                              if c in asg_done_df.columns]
+            done_view = asg_done_df[edit_cols_done].copy()
+
+            edited_done = st.data_editor(
+                done_view,
+                key="editor_assignments_done",
+                num_rows="fixed",
+                disabled=["QuoteID","Client"],
+                column_config={
+                    "StartDate": st.column_config.DateColumn("Start Date"),
+                    "EndDate": st.column_config.DateColumn("End Date"),
+                    "Payment": st.column_config.NumberColumn("Crew Payment", format="$%.2f"),
+                    "TaskStatus": st.column_config.SelectboxColumn(
+                        "Task Status",
+                        options=["Not started","In progress","On hold","Completed"],
+                    ),
+                    "Completed": st.column_config.CheckboxColumn("Completed"),
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if st.button("Save Completed Table", key="save_assignments_done"):
+                edited_done = _to_datetime_if_present(edited_done, ["StartDate","EndDate"])
+                edited_done = _to_numeric_if_present(edited_done, ["Payment"])
+
+                for rid, row in edited_done.iterrows():
+                    for c in ["CrewMember","StartDate","EndDate","Payment","TaskStatus","Notes","Completed"]:
+                        if c in assignments.columns and c in row.index:
+                            assignments.at[rid, c] = row[c]
+                    # Sync TaskStatus with Completed
+                    if bool(assignments.at[rid, "Completed"]):
+                        assignments.at[rid, "TaskStatus"] = "Completed"
+                    elif assignments.at[rid, "TaskStatus"] == "Completed":
+                        assignments.at[rid, "TaskStatus"] = "Not started"
+
+                if {"StartDate","EndDate","DaysTaken"}.issubset(assignments.columns):
+                    sd = pd.to_datetime(assignments["StartDate"], errors="coerce")
+                    ed = pd.to_datetime(assignments["EndDate"], errors="coerce")
+                    assignments["DaysTaken"] = (ed - sd).dt.days.fillna(0).astype(int)
+
+                if save_data(sales, collections, assignments):
+                    st.success("Completed table updated.")
+                    st.rerun()
+                else:
+                    st.stop()
+
+    # ---- All (everything, one editable table)
+    with tab_all:
+        st.subheader("All Assignments (Editable)")
+        if assignments.empty:
+            st.info("No assignments yet.")
+        else:
+            all_cols = [c for c in ["QuoteID","Client","CrewMember","StartDate","EndDate","Payment","TaskStatus","Notes","Completed"]
+                        if c in assignments.columns]
+            all_view = assignments[all_cols].copy()
+
+            edited_all = st.data_editor(
+                all_view,
+                key="editor_assignments_all",
+                num_rows="fixed",
+                disabled=["QuoteID","Client"],
+                column_config={
+                    "StartDate": st.column_config.DateColumn("Start Date"),
+                    "EndDate": st.column_config.DateColumn("End Date"),
+                    "Payment": st.column_config.NumberColumn("Crew Payment", format="$%.2f"),
+                    "TaskStatus": st.column_config.SelectboxColumn(
+                        "Task Status",
+                        options=["Not started","In progress","On hold","Completed"],
+                    ),
+                    "Completed": st.column_config.CheckboxColumn("Completed"),
+                },
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            if st.button("Save All Assignments", key="save_assignments_all"):
+                edited_all = _to_datetime_if_present(edited_all, ["StartDate","EndDate"])
+                edited_all = _to_numeric_if_present(edited_all, ["Payment"])
+
+                for rid, row in edited_all.iterrows():
+                    for c in ["CrewMember","StartDate","EndDate","Payment","TaskStatus","Notes","Completed"]:
+                        if c in assignments.columns and c in row.index:
+                            assignments.at[rid, c] = row[c]
+                    # Sync TaskStatus with Completed
+                    if bool(assignments.at[rid, "Completed"]):
+                        assignments.at[rid, "TaskStatus"] = "Completed"
+                    elif assignments.at[rid, "TaskStatus"] == "Completed":
+                        assignments.at[rid, "TaskStatus"] = "Not started"
+
+                if {"StartDate","EndDate","DaysTaken"}.issubset(assignments.columns):
+                    sd = pd.to_datetime(assignments["StartDate"], errors="coerce")
+                    ed = pd.to_datetime(assignments["EndDate"], errors="coerce")
+                    assignments["DaysTaken"] = (ed - sd).dt.days.fillna(0).astype(int)
+
+                if save_data(sales, collections, assignments):
+                    st.success("Assignments updated.")
+                    st.rerun()
+                else:
+                    st.stop()
+
 
 # ---------------- View Reports ----------------
 if page == "View Reports":
     st.title("📊 View Reports")
     st.markdown("Here you can view and download reports for Sales Log, Collections, and Assignments.")
+    rpt_filtered_sales, rpt_rep, rpt_start, rpt_end = build_filters_ui(sales, "rpt")
 
     sales, collections, assignments = load_data()
 
     report_tabs = st.radio("Select a Report to View", ("Sales Log", "Collections", "Assignments"))
 
+    # Tab bodies:
     if report_tabs == "Sales Log":
-        st.subheader("Sales Log")
-        st.write(sales)
+        st.subheader("Sales Log (Filtered)")
+        st.write(rpt_filtered_sales)
     elif report_tabs == "Collections":
-        st.subheader("Collections")
-        st.write(collections)
+        st.subheader("Collections (Filtered to matching Sales)")
+        rpt_ids = rpt_filtered_sales["QuoteID"].dropna().astype(int).unique() if "QuoteID" in rpt_filtered_sales.columns else []
+        st.write(collections[collections["QuoteID"].isin(rpt_ids)])
     elif report_tabs == "Assignments":
-        st.subheader("Assignments")
-        st.write(assignments)
-
-    # Download button for unified report (Excel file with three tabs)
-    st.subheader("Download Unified Report")
-    st.markdown("Click the button below to download the report with Sales Log, Collections, and Assignments as separate tabs in an Excel file.")
+        st.subheader("Assignments (Filtered to matching Sales)")
+        rpt_ids = rpt_filtered_sales["QuoteID"].dropna().astype(int).unique() if "QuoteID" in rpt_filtered_sales.columns else []
+        st.write(assignments[assignments["QuoteID"].isin(rpt_ids)])
+        # Download button for unified report (Excel file with three tabs)
+        st.subheader("Download Unified Report")
+        st.markdown("Click the button below to download the report with Sales Log, Collections, and Assignments as separate tabs in an Excel file.")
 
     def create_excel_report(sales, collections, assignments):
         excel_file = io.BytesIO()
