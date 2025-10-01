@@ -355,12 +355,12 @@ def generate_unique_quote_id(area, sales):
     s["QuoteID"] = pd.to_numeric(s["QuoteID"], errors="coerce").fillna(0).astype(int)
 
     if area == "Toms River":
-        candidates = s.loc[(s["QuoteID"] >= 1000) & (s["QuoteID"] < 2000), "QuoteID"]
-        return (candidates.max() + 1) if not candidates.empty else 1000
+        candidates = s.loc[(s["QuoteID"] >= 1406) & (s["QuoteID"] < 2000), "QuoteID"]
+        return (candidates.max() + 1) if not candidates.empty else 1406
 
     if area == "Manahawkin":
-        candidates = s.loc[(s["QuoteID"] >= 2000) & (s["QuoteID"] < 3000), "QuoteID"]
-        return (candidates.max() + 1) if not candidates.empty else 2000
+        candidates = s.loc[(s["QuoteID"] >= 2079) & (s["QuoteID"] < 3000), "QuoteID"]
+        return (candidates.max() + 1) if not candidates.empty else 2079
 
     # Fallback range (optional): 3000+
     candidates = s.loc[s["QuoteID"] >= 3000, "QuoteID"]
@@ -923,6 +923,8 @@ elif page == "Collections":
             # Normalize types coming back from the editor
             edited_col = _to_datetime_if_present(edited_col, ["CollectionDate"])
             edited_col = _to_numeric_if_present(edited_col, ["DepositPaid"])
+            
+            
 
             # Write the edited fields back to the *base* collections using the Row key
             for _, r in edited_col.iterrows():
@@ -939,6 +941,73 @@ elif page == "Collections":
                 st.rerun()
             else:
                 st.stop()
+            if st.button("Save Collections Table Edits", key="save_collections"):
+            # Normalize types coming back from the editor
+                edited_col = _to_datetime_if_present(edited_col, ["CollectionDate"])
+                edited_col = _to_numeric_if_present(edited_col, ["DepositPaid"])
+
+            # Write the edited fields back to the *base* collections using the Row key
+            for _, r in edited_col.iterrows():
+                rid = int(r["Row"])
+                for c in ["CollectionDate", "Client", "DepositPaid", "Status"]:
+                    if c in collections.columns:
+                        collections.at[rid, c] = r[c]
+
+            # Recompute derived fields and persist
+            sales = sync_deposit_paid(sales, collections)
+            collections = update_balance_due(sales, collections)
+            if save_data(sales, collections, assignments):
+                st.success("Collections updated.")
+                st.rerun()
+            else:
+                st.stop()
+
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+# INSERT THE NEW SUMMARY BLOCK *HERE* (still inside the Collections page)
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+        # --- Completed Jobs (from Assignments) → Balance Due summary ---
+        st.markdown("### Completed Jobs — Balance Due")
+
+        # 1) Find completed QuoteIDs in Assignments
+        if "Completed" in assignments.columns:
+            completed_ids = (
+                assignments.loc[assignments["Completed"] == True, "QuoteID"]
+                .dropna().astype(int).unique()
+            )
+        else:
+            completed_ids = []
+
+        # 2) Keep in-sync with the current Collections filter (won jobs shown on the page)
+        if "QuoteID" in won_sales.columns:
+            won_ids_now = set(won_sales["QuoteID"].dropna().astype(int).tolist())
+            completed_ids = [qid for qid in completed_ids if qid in won_ids_now]
+
+        # 3) Build the summary from Sales (single row per QuoteID = cleanest BalanceDue)
+        if len(completed_ids) == 0:
+            st.info("No completed jobs under the current filters.")
+        else:
+            comp_view = sales.loc[
+                sales["QuoteID"].isin(completed_ids),
+                ["QuoteID", "Client", "QuotedPrice", "DepositPaid"]
+            ].copy()
+
+    # BalanceDue = QuotedPrice - DepositPaid
+    comp_view["QuotedPrice"] = pd.to_numeric(comp_view["QuotedPrice"], errors="coerce").fillna(0.0)
+    comp_view["DepositPaid"] = pd.to_numeric(comp_view["DepositPaid"], errors="coerce").fillna(0.0)
+    comp_view["BalanceDue"] = (comp_view["QuotedPrice"] - comp_view["DepositPaid"]).clip(lower=0.0)
+
+    # Show only the requested columns
+    out = comp_view[["QuoteID", "Client", "BalanceDue"]].copy()
+
+    # Sort numerically before formatting
+    out = out.sort_values("BalanceDue", ascending=False)
+
+    # Format BalanceDue for display
+    out["BalanceDue"] = _fmt_currency_series(out["BalanceDue"])
+
+    st.dataframe(out, use_container_width=True)
+
 
 
 
