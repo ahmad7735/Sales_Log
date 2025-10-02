@@ -464,6 +464,10 @@ if page == "Dashboard":
 
     # Core KPIs
     total_revenue_won = float(won_sales["QuotedPrice"].sum()) if "QuotedPrice" in won_sales.columns else 0.0
+    # Average Job Size = Closed $ / Jobs Won
+    jobs_won_count = len(won_sales)
+    avg_job_size = (total_revenue_won / jobs_won_count) if jobs_won_count > 0 else 0.0
+
 
     # Split collections into: initial deposit (first ledger row per QuoteID) vs follow-ups
     if not filtered_collections.empty:
@@ -497,12 +501,14 @@ if page == "Dashboard":
     col5, col6, col7, col8 = st.columns(4)
     win_rate = (len(won_sales) / len(filtered_sales) * 100) if len(filtered_sales) > 0 else 0.0
     col5.metric("Win Rate %", f"{win_rate:.1f}%")
-    col6.metric("Closed $", f"${total_revenue_won:,.0f}")
-    col7.metric("Deposits Paid", f"${total_deposit_won:,.0f}")   # initial deposits only
-    col8.metric("Balance Due", f"${balance_due_won_jobs:,.0f}")
-
-    # Follow-ups only
-    st.metric("Total Collected (Collections)", f"${total_collections_won:,.0f}")
+    col6.metric("Avg Job Size", f"${avg_job_size:,.0f}")
+    col7.metric("Closed $", f"${total_revenue_won:,.0f}")
+    col8.metric("Deposits Paid", f"${total_deposit_won:,.0f}")   # initial deposits only
+    col9, col10, col11, col12 = st.columns(4)
+    
+    col9.metric("Balance Due", f"${balance_due_won_jobs:,.0f}")
+    col10.metric("Total Collected (Collections)", f"${total_collections_won:,.0f}")
+    
 
     # ---- Revenue Breakdown (unchanged logic) ----
     st.subheader("Revenue Breakdown")
