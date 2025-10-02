@@ -205,81 +205,86 @@ def apply_saved_filters(df: pd.DataFrame, key_prefix: str, date_col: str = "Sent
 def sync_deposit_paid(sales: pd.DataFrame, collections: pd.DataFrame) -> pd.DataFrame:
     """
     Make Sales.DepositPaid = SUM(Collections.DepositPaid) per QuoteID.
-    This avoids double counting and keeps Sales as the single source of truth for totals.
+    Safe with empty/missing columns on first boot.
     """
-    s = sales.copy()
-    c = collections.copy()
+    s = (sales.copy() if isinstance(sales, pd.DataFrame) else pd.DataFrame())
+    c = (collections.copy() if isinstance(collections, pd.DataFrame) else pd.DataFrame())
 
-    # Normalize
-    for df in (s, c):
-        if "QuoteID" in df.columns:
-            df["QuoteID"] = pd.to_numeric(df["QuoteID"], errors="coerce").fillna(0).astype(int)
+    # Ensure required cols exist with correct dtypes
+    if "QuoteID" not in s.columns:
+        s["QuoteID"] = pd.Series(dtype="int64")
+    if "QuotedPrice" not in s.columns:
+        s["QuotedPrice"] = 0.0
+    if "DepositPaid" not in s.columns:
+        s["DepositPaid"] = 0.0
 
-    s["QuotedPrice"]   = pd.to_numeric(s.get("QuotedPrice", 0), errors="coerce").fillna(0.0)
-    c["DepositPaid"]   = pd.to_numeric(c.get("DepositPaid", 0), errors="coerce").fillna(0.0)
+    if "QuoteID" not in c.columns:
+        c["QuoteID"] = pd.Series(dtype="int64")
+    if "DepositPaid" not in c.columns:
+        c["DepositPaid"] = 0.0
+
+    # Normalize dtypes
+    s["QuoteID"]    = pd.to_numeric(s["QuoteID"], errors="coerce").fillna(0).astype(int)
+    s["QuotedPrice"]= pd.to_numeric(s["QuotedPrice"], errors="coerce").fillna(0.0)
+    s["DepositPaid"]= pd.to_numeric(s["DepositPaid"], errors="coerce").fillna(0.0)
+    c["QuoteID"]    = pd.to_numeric(c["QuoteID"], errors="coerce").fillna(0).astype(int)
+    c["DepositPaid"]= pd.to_numeric(c["DepositPaid"], errors="coerce").fillna(0.0)
 
     # Sum every collection (initial + follow-ups) per QuoteID
-    sums = c.groupby("QuoteID", dropna=False)["DepositPaid"].sum(min_count=1)
+    if not c.empty and "QuoteID" in c.columns and "DepositPaid" in c.columns:
+        sums = c.groupby("QuoteID", dropna=False)["DepositPaid"].sum(min_count=1)
+    else:
+        sums = pd.Series(dtype=float)
+
     s["DepositPaid"] = s["QuoteID"].map(sums).fillna(0.0).astype(float)
 
     # Recompute %
     s["Deposit%"] = s.apply(
-        lambda r: round((r["DepositPaid"] / r["QuotedPrice"]) * 100, 2) if r["QuotedPrice"] > 0 else 0.0,
+        lambda r: round((r["DepositPaid"] / r["QuotedPrice"]) * 100, 2) if float(r["QuotedPrice"]) > 0 else 0.0,
         axis=1
     )
     return s
 
 
-    # (unused legacy code below intentionally preserved but never reached)
-    merged = c.merge(
-        s[["QuoteID", "DepositPaid"]].rename(columns={"DepositPaid": "InitialDeposit"}),
-        on="QuoteID", how="left"
-    )
-    merged["InitialDeposit"] = pd.to_numeric(merged["InitialDeposit"], errors="coerce").fillna(0.0)
-    raw_sum = merged.groupby("QuoteID")["DepositPaid"].sum()
-    has_legacy = (
-        (merged["DepositPaid"].round(2) == merged["InitialDeposit"].round(2))
-        .groupby(merged["QuoteID"])
-        .any()
-    )
-    initial_map = s.set_index("QuoteID")["DepositPaid"]
-    adj_sum = raw_sum - initial_map.where(has_legacy, 0.0)
-    adj_sum = adj_sum.reindex(s["QuoteID"].unique(), fill_value=0.0)
-    total_paid = initial_map.add(adj_sum, fill_value=0.0)
-    s = s.set_index("QuoteID")
-    s.loc[total_paid.index, "DepositPaid"] = total_paid.values
-    s["Deposit%"] = s.apply(
-        lambda r: round((r["DepositPaid"] / r["QuotedPrice"]) * 100, 2) if r["QuotedPrice"] > 0 else 0.0,
-        axis=1
-    )
-    return s.reset_index()
-
-
-
 def update_balance_due(sales: pd.DataFrame, collections: pd.DataFrame) -> pd.DataFrame:
     """
-    BalanceDue per QuoteID = QuotedPrice - Sales.DepositPaid  (Sales.DepositPaid is TOTAL to date).
+    BalanceDue per QuoteID = QuotedPrice - Sales.DepositPaid.
+    Safe with empty/missing columns on first boot.
     """
-    s = sales.copy()
-    c = collections.copy()
+    s = (sales.copy() if isinstance(sales, pd.DataFrame) else pd.DataFrame())
+    c = (collections.copy() if isinstance(collections, pd.DataFrame) else pd.DataFrame())
+
+    # Ensure required cols exist with correct dtypes
+    for col, default in [("QuoteID", pd.Series(dtype="int64")),
+                         ("QuotedPrice", 0.0),
+                         ("DepositPaid", 0.0)]:
+        if col not in s.columns:
+            s[col] = default
+
+    if "QuoteID" not in c.columns:
+        c["QuoteID"] = pd.Series(dtype="int64")
 
     # Normalize
-    for df in (s, c):
-        if "QuoteID" in df.columns:
-            df["QuoteID"] = pd.to_numeric(df["QuoteID"], errors="coerce").fillna(0).astype(int)
-    s["QuotedPrice"] = pd.to_numeric(s.get("QuotedPrice", 0), errors="coerce").fillna(0.0)
-    s["DepositPaid"] = pd.to_numeric(s.get("DepositPaid", 0), errors="coerce").fillna(0.0)
+    s["QuoteID"]     = pd.to_numeric(s["QuoteID"], errors="coerce").fillna(0).astype(int)
+    s["QuotedPrice"] = pd.to_numeric(s["QuotedPrice"], errors="coerce").fillna(0.0)
+    s["DepositPaid"] = pd.to_numeric(s["DepositPaid"], errors="coerce").fillna(0.0)
+    c["QuoteID"]     = pd.to_numeric(c["QuoteID"], errors="coerce").fillna(0).astype(int)
 
-    price_map = s.set_index("QuoteID")["QuotedPrice"]
-    paid_map  = s.set_index("QuoteID")["DepositPaid"]
-    balance   = (price_map - paid_map).clip(lower=0.0)
+    # Compute balance map
+    if not s.empty:
+        balance = (s.set_index("QuoteID")["QuotedPrice"] - s.set_index("QuoteID")["DepositPaid"]).clip(lower=0.0)
+    else:
+        balance = pd.Series(dtype=float)
+
+    # Ensure BalanceDue column exists
+    if "BalanceDue" not in c.columns:
+        c["BalanceDue"] = pd.Series(dtype=float)
 
     if not c.empty:
         c["BalanceDue"] = c["QuoteID"].map(balance).fillna(0.0).astype(float)
-    else:
-        if "BalanceDue" not in c.columns:
-            c["BalanceDue"] = pd.Series(dtype="float")
+
     return c
+
 
 
 
