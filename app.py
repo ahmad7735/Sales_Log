@@ -5,6 +5,11 @@ import time
 import io
 import os
 import tempfile
+from sqlalchemy import text
+from db import get_engine, init_schema
+
+engine = get_engine()
+init_schema()
 
 
 # File path
