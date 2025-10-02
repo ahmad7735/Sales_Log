@@ -11,88 +11,69 @@ import requests
 from io import BytesIO
 
 
-import base64, json, requests
-
-# ---- SETTINGS (from Streamlit secrets) ----
-# Add these keys in Streamlit Cloud (Settings → Secrets):
-# [github]
-# repo = "ahmad7735/Sales_Log"
-# branch = "main"            # set to "main" OR "master" EXACTLY as your repo shows
-# file_path = "data.xlsx"    # JUST the path in the repo (no https://…)
-# token = "ghp_... or github_pat_..."  # OPTIONAL for PRIVATE repo
+import base64, json, requests, io
+from datetime import datetime
 
 def _gh_headers():
-    token = st.secrets.get("github", {}).get("token", "")
+    from streamlit.runtime.secrets import secrets
+    tok = secrets["github"].get("token", "")
     h = {"Accept": "application/vnd.github+json"}
-    if token:
-        h["Authorization"] = f"Bearer {token}"
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
     return h
 
-def _gh_api_base():
-    repo = st.secrets["github"]["repo"]
-    return f"https://api.github.com/repos/{repo}"
+def _gh_ctx():
+    from streamlit.runtime.secrets import secrets
+    owner, repo = secrets["github"]["repo"].split("/", 1)
+    return owner, repo, secrets["github"]["branch"], secrets["github"]["file_path"]
 
 def read_excel_from_github() -> bytes:
-    """Return the Excel file bytes from GitHub (public or private)."""
-    cfg = st.secrets.get("github", {})
-    repo = cfg.get("repo")
-    branch = cfg.get("branch", "main")
-    rel_path = cfg.get("file_path", "data.xlsx")
-    if not repo:
-        raise RuntimeError("GitHub repo not configured in secrets: [github].repo is missing.")
+    """Return raw bytes of the Excel from GitHub (tries raw URL first, then Contents API)."""
+    owner, repo, branch, path = _gh_ctx()
 
-    # 1) Try GitHub Contents API (works for private & public)
-    url = f"{_gh_api_base()}/contents/{rel_path}?ref={branch}"
-    r = requests.get(url, headers=_gh_headers(), timeout=20)
+    # 1) Try raw CDN (fast, anonymous for public repos)
+    raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}"
+    r = requests.get(raw_url, timeout=20)
+    if r.status_code == 200:
+        return r.content
+
+    # 2) Contents API (works for private repos with a token)
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    r = requests.get(api_url, headers=_gh_headers(), timeout=20)
     if r.status_code == 200:
         data = r.json()
-        if data.get("encoding") == "base64":
-            return base64.b64decode(data["content"])
-        else:
-            # Some proxies return raw bytes; handle that too
-            content = data.get("content")
-            if content:
-                return base64.b64decode(content)
-            raise RuntimeError("Unexpected GitHub response: no base64 content.")
-    # 2) If that failed AND the repo is public, try raw URL without token
-    raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{rel_path}"
-    r2 = requests.get(raw_url, timeout=20)
-    if r2.status_code == 200:
-        return r2.content
+        return base64.b64decode(data["content"])
+    raise RuntimeError(f"Failed to download Excel from GitHub. Raw URL: {r.status_code} {r.text} "
+                       f"Contents API: {r.status_code} {r.text}")
 
-    # Surface helpful error message
-    raise RuntimeError(
-        "Failed to download Excel from GitHub.\n"
-        f"Contents API: {r.status_code} {r.text[:200]}\n"
-        f"Raw URL: {r2.status_code} {r2.text[:200]}"
-    )
+def write_excel_to_github(xls_bytes: bytes, commit_message: str):
+    """
+    Create or update the Excel file using the Contents API.
+    If file exists, we MUST include its SHA; otherwise omit SHA.
+    """
+    owner, repo, branch, path = _gh_ctx()
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
 
-def write_excel_to_github(file_bytes: bytes, commit_message="Update data.xlsx"):
-    """Create/update data.xlsx in repo via GitHub API (requires token with 'repo' scope for private)."""
-    cfg = st.secrets["github"]
-    repo   = cfg["repo"]
-    branch = cfg.get("branch", "main")
-    path   = cfg.get("file_path", "data.xlsx")
+    # 1) Check if file exists to get SHA
+    r = requests.get(f"{url}?ref={branch}", headers=_gh_headers(), timeout=20)
+    sha = None
+    if r.status_code == 200:
+        sha = r.json().get("sha")
+    elif r.status_code not in (200, 404):
+        raise RuntimeError(f"Pre-check failed: {r.status_code} {r.text}")
 
-    # 1) Get current file SHA (required for update; not required for create)
-    get_url = f"{_gh_api_base()}/contents/{path}"
-    get_params = {"ref": branch}
-    g = requests.get(get_url, headers=_gh_headers(), params=get_params, timeout=20)
-    sha = g.json().get("sha") if g.status_code == 200 else None
-
-    # 2) Create or update the file
-    put_url = f"{_gh_api_base()}/contents/{path}"
+    # 2) PUT create/update
     payload = {
         "message": commit_message,
-        "content": base64.b64encode(file_bytes).decode("utf-8"),
-        "branch": branch
+        "branch": branch,
+        "content": base64.b64encode(xls_bytes).decode("utf-8"),
+        # only include sha if updating an existing file
+        **({"sha": sha} if sha else {})
     }
-    if sha:
-        payload["sha"] = sha  # include for update
+    r = requests.put(url, headers=_gh_headers(), data=json.dumps(payload), timeout=30)
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub write failed: {r.status_code} {r.text}")
 
-    p = requests.put(put_url, headers=_gh_headers(), data=json.dumps(payload), timeout=30)
-    if p.status_code not in (200, 201):
-        raise RuntimeError(f"GitHub write failed: {p.status_code} {p.text[:500]}")
 
 
 def load_data():
@@ -155,21 +136,21 @@ def load_data():
 
 def save_data(sales, collections, assignments):
     try:
-        # 1) Write to an in-memory Excel file
+        # (your existing cleanup/ordering code above)
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl", mode="w") as writer:
-            sales.to_excel(writer, sheet_name="SalesLog", index=False)
-            collections.to_excel(writer, sheet_name="Collections", index=False)
-            assignments.to_excel(writer, sheet_name="Assignments", index=False)
-            # (optional) your openpyxl formatting here if you want, but keep it quick for cloud
+            sales_to_save.to_excel(writer, sheet_name="SalesLog", index=False)
+            collections_to_save.to_excel(writer, sheet_name="Collections", index=False)
+            assignments_to_save.to_excel(writer, sheet_name="Assignments", index=False)
+            # (optional: openpyxl number formats like you already do)
         buf.seek(0)
 
-        # 2) Push to GitHub
-        write_excel_to_github(buf.read(), commit_message="Update data.xlsx via Streamlit app")
+        write_excel_to_github(buf.read(), commit_message=f"Update data.xlsx via app at {datetime.utcnow().isoformat()}Z")
         return True
     except Exception as e:
-        st.error(f"💥 Save failed: {type(e).__name__}: {e}")
+        st.error(f"Save failed: {type(e).__name__}: {e}")
         return False
+
 
 
 
