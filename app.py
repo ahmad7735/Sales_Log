@@ -5,6 +5,11 @@ import time
 import io
 import os
 import tempfile
+import base64
+import json
+import requests
+from io import BytesIO
+
 
 
 # File path
@@ -16,65 +21,109 @@ start_date = end_date = None
 
 # ---------------- Data IO ----------------
 # Removing @st.cache_data to avoid caching issues
-def load_data():
-    sales = pd.read_excel(EXCEL_FILE, sheet_name="SalesLog")
-    collections = pd.read_excel(EXCEL_FILE, sheet_name="Collections")
-    assignments = pd.read_excel(EXCEL_FILE, sheet_name="Assignments")
-    # after: assignments = pd.read_excel(EXCEL_FILE, sheet_name="Assignments")
+def _gh_headers():
+    return {
+        "Authorization": f"Bearer {st.secrets['github']['token']}",
+        "Accept": "application/vnd.github+json",
+    }
 
-    # Make sure we have Completed (bool) and TaskStatus (str)
+def _gh_repo_info():
+    return (
+        st.secrets["github"]["repo"],
+        st.secrets["github"]["branch"],
+        st.secrets["github"]["file_path"],
+    )
+
+def read_excel_from_github() -> BytesIO:
+    """Download data.xlsx bytes from GitHub and return a BytesIO."""
+    repo, branch, path = _gh_repo_info()
+    # Raw file contents API
+    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
+    r = requests.get(url, headers={"Accept": "application/octet-stream"})
+    if r.status_code != 200:
+        raise RuntimeError(f"Failed to download Excel from GitHub: {r.status_code} {r.text}")
+    return BytesIO(r.content)
+
+def _get_file_sha(repo: str, path: str, branch: str) -> str | None:
+    """Get the current blob SHA for the file (needed to update). Returns None if file doesn’t exist."""
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    params = {"ref": branch}
+    r = requests.get(url, headers=_gh_headers(), params=params)
+    if r.status_code == 200:
+        return r.json().get("sha")
+    elif r.status_code == 404:
+        return None
+    else:
+        raise RuntimeError(f"Failed to fetch file sha: {r.status_code} {r.text}")
+
+def commit_excel_to_github(excel_bytes: bytes, commit_message: str) -> None:
+    """Create or update data.xlsx in the repo on the configured branch."""
+    repo, branch, path = _gh_repo_info()
+    sha = _get_file_sha(repo, path, branch)
+
+    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    payload = {
+        "message": commit_message,
+        "content": base64.b64encode(excel_bytes).decode("utf-8"),
+        "branch": branch,
+    }
+    if sha:
+        payload["sha"] = sha  # required to update an existing file
+
+    r = requests.put(url, headers=_gh_headers(), data=json.dumps(payload))
+    if r.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub commit failed: {r.status_code} {r.text}")
+
+def load_data():
+    # Read Excel from GitHub
+    xls = read_excel_from_github()
+    sales = pd.read_excel(xls, sheet_name="SalesLog")
+    collections = pd.read_excel(xls, sheet_name="Collections")
+    assignments = pd.read_excel(xls, sheet_name="Assignments")
+
+    # The same normalization you already had:
     if "Completed" not in assignments.columns:
         assignments["Completed"] = False
     else:
         assignments["Completed"] = assignments["Completed"].astype(bool)
 
     if "TaskStatus" not in assignments.columns:
-        # default to "Not started" for open rows, "Completed" for completed rows
         assignments["TaskStatus"] = assignments["Completed"].map(lambda x: "Completed" if x else "Not started")
     else:
         assignments["TaskStatus"] = assignments["TaskStatus"].astype(str)
 
-    # NEW: guarantee + normalize the CollectionDate column
     if "CollectionDate" not in collections.columns:
         collections["CollectionDate"] = pd.NaT
     else:
         collections["CollectionDate"] = pd.to_datetime(collections["CollectionDate"], errors="coerce")
 
-    # Ensure numeric
     sales["QuotedPrice"] = pd.to_numeric(sales.get("QuotedPrice", 0), errors="coerce").fillna(0)
     sales["DepositPaid"] = pd.to_numeric(sales.get("DepositPaid", 0), errors="coerce").fillna(0)
     collections["QuoteID"] = pd.to_numeric(collections.get("QuoteID", 0), errors="coerce")
     collections["DepositPaid"] = pd.to_numeric(collections.get("DepositPaid", 0), errors="coerce").fillna(0)
 
-    # Ensure dates
     if "SentDate" in sales.columns:
         sales["SentDate"] = pd.to_datetime(sales["SentDate"], errors="coerce")
-        
-    # Ensure QuoteID column exists
+
     if "QuoteID" not in sales.columns:
         sales["QuoteID"] = pd.Series(dtype="int")
 
-    # Normalize QuoteID
     sales["QuoteID"] = pd.to_numeric(sales["QuoteID"], errors="coerce").fillna(0).astype(int)
     collections["QuoteID"] = pd.to_numeric(collections["QuoteID"], errors="coerce").fillna(0).astype(int)
 
-    # 🚫 Drop DepositDue if still present in file
     collections = collections.drop(columns=["DepositDue"], errors="ignore")
-
-    # Ensure Status exists
     if "Status" not in collections.columns:
         collections["Status"] = ""
 
     return sales, collections, assignments
 
 
-def save_data(sales, collections, assignments):
+def _build_excel_bytes(sales: pd.DataFrame, collections: pd.DataFrame, assignments: pd.DataFrame) -> bytes:
+    """Create your nicely formatted Excel (as before), but in-memory; return bytes."""
     SALES_ORDER = ["QuoteID", "Client", "QuotedPrice", "Status", "SalesRep",
                    "Deposit%", "DepositPaid", "SentDate", "JobType"]
-    # No DepositDue here ✅
     COLLECTIONS_ORDER = ["QuoteID", "CollectionDate", "Client", "DepositPaid", "BalanceDue", "Status"]
 
-    # Normalize key columns
     for df in (sales, collections, assignments):
         if "QuoteID" in df.columns:
             df["QuoteID"] = pd.to_numeric(df["QuoteID"], errors="coerce").fillna(0).astype(int)
@@ -82,14 +131,11 @@ def save_data(sales, collections, assignments):
     def ensure_and_order(df, desired, fill_defaults=None):
         df = df.copy()
         fill_defaults = fill_defaults or {}
-        # make sure desired cols exist
         for col in desired:
             if col not in df.columns:
                 df[col] = fill_defaults.get(col, pd.NA)
-        # drop DepositDue explicitly if present
         if "DepositDue" in df.columns:
             df = df.drop(columns=["DepositDue"])
-        # order: desired first, then extras
         extras = [c for c in df.columns if c not in desired]
         return df[desired + extras]
 
@@ -103,62 +149,52 @@ def save_data(sales, collections, assignments):
     )
     assignments_to_save = assignments.copy()
 
-    dir_name = os.path.dirname(os.path.abspath(EXCEL_FILE))
-    base_name = os.path.basename(EXCEL_FILE)
-    tmp_path = None
+    # Build Excel in memory
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl", mode="w") as writer:
+        sales_to_save.to_excel(writer, sheet_name="SalesLog", index=False)
+        collections_to_save.to_excel(writer, sheet_name="Collections", index=False)
+        assignments_to_save.to_excel(writer, sheet_name="Assignments", index=False)
 
+        # formatting (same as you had)
+        from openpyxl.utils import get_column_letter
+        wb = writer.book
+        ws_sales = writer.sheets["SalesLog"]
+        ws_col = writer.sheets["Collections"]
+
+        currency_fmt = '"$"#,##0.00'
+        date_fmt = 'yyyy-mm-dd'
+        percent_literal_fmt = '0.00"%"'
+
+        def format_column(ws, df, col_name, num_fmt):
+            if col_name in df.columns:
+                col_idx = df.columns.get_loc(col_name) + 1
+                col_letter = get_column_letter(col_idx)
+                for cell in ws[col_letter][1:]:
+                    cell.number_format = num_fmt
+
+        format_column(ws_sales, sales_to_save, "QuotedPrice", currency_fmt)
+        format_column(ws_sales, sales_to_save, "DepositPaid", currency_fmt)
+        format_column(ws_sales, sales_to_save, "SentDate", date_fmt)
+        format_column(ws_sales, sales_to_save, "Deposit%", percent_literal_fmt)
+
+        format_column(ws_col, collections_to_save, "DepositPaid", currency_fmt)
+        format_column(ws_col, collections_to_save, "BalanceDue", currency_fmt)
+        format_column(ws_col, collections_to_save, "CollectionDate", date_fmt)
+
+    bio.seek(0)
+    return bio.read()
+
+
+def save_data(sales, collections, assignments):
+    """Create the updated Excel and commit it back to GitHub."""
     try:
-        with tempfile.NamedTemporaryFile(delete=False, dir=dir_name, prefix=base_name, suffix=".xlsx") as tmp:
-            tmp_path = tmp.name
-
-        with pd.ExcelWriter(tmp_path, engine="openpyxl", mode="w") as writer:
-            sales_to_save.to_excel(writer, sheet_name="SalesLog", index=False)
-            collections_to_save.to_excel(writer, sheet_name="Collections", index=False)
-            assignments_to_save.to_excel(writer, sheet_name="Assignments", index=False)
-
-            # >>> Apply Excel number formats (currency + date + percent display) <<<
-            from openpyxl.utils import get_column_letter
-
-            wb = writer.book
-            ws_sales = writer.sheets["SalesLog"]
-            ws_col = writer.sheets["Collections"]
-
-            currency_fmt = '"$"#,##0.00'
-            date_fmt = 'yyyy-mm-dd'
-            percent_literal_fmt = '0.00"%"'  # shows 20 as 20.00% (no scaling)
-
-            def format_column(ws, df, col_name, num_fmt):
-                if col_name in df.columns:
-                    col_idx = df.columns.get_loc(col_name) + 1  # 1-based
-                    col_letter = get_column_letter(col_idx)
-                    # skip header at row 1
-                    for cell in ws[col_letter][1:]:
-                        cell.number_format = num_fmt
-
-            # SalesLog: $ for money, date-only for dates, literal % for Deposit%
-            format_column(ws_sales, sales_to_save, "QuotedPrice", currency_fmt)
-            format_column(ws_sales, sales_to_save, "DepositPaid", currency_fmt)
-            format_column(ws_sales, sales_to_save, "SentDate", date_fmt)
-            format_column(ws_sales, sales_to_save, "Deposit%", percent_literal_fmt)
-
-            # Collections: $ for money
-            format_column(ws_col, collections_to_save, "DepositPaid", currency_fmt)
-            format_column(ws_col, collections_to_save, "BalanceDue", currency_fmt)
-            format_column(ws_col, collections_to_save, "CollectionDate", date_fmt)
-
-            
-
-        os.replace(tmp_path, os.path.abspath(EXCEL_FILE))  # atomic replace
+        excel_bytes = _build_excel_bytes(sales, collections, assignments)
+        commit_excel_to_github(excel_bytes, commit_message="Update data.xlsx from Streamlit app")
         return True
-    except PermissionError:
-        st.error("⚠️ Could not save data. Please close 'data.xlsx' (Excel might have it open) and try again.")
     except Exception as e:
-        st.error(f"💥 Save failed: {type(e).__name__}: {e}")
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except Exception: pass
-    return False
+        st.error(f"💥 Save failed (GitHub): {type(e).__name__}: {e}")
+        return False
 
 
 
