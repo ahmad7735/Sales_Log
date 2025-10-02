@@ -601,100 +601,100 @@ if page == "Sales Log":
 
     # If no sale added or user selected "Yes" to add another
    # If no sale added or user selected "Yes" to add another
-if st.session_state.get("sale_added") is None:
-    st.subheader("Add New Sale")
+    if st.session_state.get("sale_added") is None:
+        st.subheader("Add New Sale")
 
-    # --- Area lives OUTSIDE the form so it can trigger a rerun immediately ---
-    area = st.selectbox("Area *", ["Toms River", "Manahawkin"], key="area_select")
+        # --- Area lives OUTSIDE the form so it can trigger a rerun immediately ---
+        area = st.selectbox("Area *", ["Toms River", "Manahawkin"], key="area_select")
 
-    # Suggest a Quote ID whenever Area changes or on first load
-    if "quote_id_input" not in st.session_state:
-        st.session_state["quote_id_input"] = int(generate_unique_quote_id(area, sales))
-        st.session_state["last_area"] = area
-    elif st.session_state.get("last_area") != area:
-        st.session_state["quote_id_input"] = int(generate_unique_quote_id(area, sales))
-        st.session_state["last_area"] = area
+        # Suggest a Quote ID whenever Area changes or on first load
+        if "quote_id_input" not in st.session_state:
+            st.session_state["quote_id_input"] = int(generate_unique_quote_id(area, sales))
+            st.session_state["last_area"] = area
+        elif st.session_state.get("last_area") != area:
+            st.session_state["quote_id_input"] = int(generate_unique_quote_id(area, sales))
+            st.session_state["last_area"] = area
 
-    # ---- Single, non-nested form for the rest of the fields ----
-    with st.form("add_sale_form"):
-        # Editable Quote ID (bound to the same key; no `value=` to avoid the warning)
-        st.number_input(
-            "Quote ID *",
-            min_value=1,
-            step=1,
-            key="quote_id_input",
-            help="Auto-suggested from Area. You can edit it."
-        )
-
-        quoted_price = st.number_input("Quoted Price *", min_value=0.0, format="%.2f", key="quoted_price_input")
-        deposit_paid = st.number_input("Deposit Paid *", min_value=0.0, format="%.2f", key="deposit_paid_input")
-        deposit_pct_preview = round((deposit_paid / quoted_price) * 100, 2) if quoted_price > 0 else 0.0
-        st.caption(f"Deposit %: {deposit_pct_preview:.2f}%")
-
-        client = st.text_input("Client *")
-        status = st.selectbox("Status *", ["Sent", "Won", "Lost"])
-        sales_rep = st.text_input("Sales Rep *")
-        sent_date = st.date_input("Sent Date *")
-        job_type = st.text_input("Job Type *")
-
-        submitted = st.form_submit_button("Add Sale")
-
-    if submitted:
-        quoted_price_val = st.session_state.get("quoted_price_input", 0.0)
-        deposit_paid_val = st.session_state.get("deposit_paid_input", 0.0)
-
-        if not client or not sales_rep or not job_type:
-            st.error("⚠️ All fields are required. Please fill them in.")
-        else:
-            # Use Area from the selectbox outside the form
-            area = st.session_state["area_select"]
-
-            # Enforce unique Quote ID
-            new_id = int(st.session_state["quote_id_input"])
-            existing_ids = set(
-                pd.to_numeric(sales.get("QuoteID", pd.Series([], dtype=int)), errors="coerce")
-                  .fillna(0).astype(int).tolist()
+        # ---- Single, non-nested form for the rest of the fields ----
+        with st.form("add_sale_form"):
+            # Editable Quote ID (bound to the same key; no `value=` to avoid the warning)
+            st.number_input(
+                "Quote ID *",
+                min_value=1,
+                step=1,
+                key="quote_id_input",
+                help="Auto-suggested from Area. You can edit it."
             )
-            if new_id in existing_ids:
-                st.error(
-                    f"⚠️ Quote ID {new_id} already exists. "
-                    f"Try another (suggested: {generate_unique_quote_id(area, sales)})."
-                )
-                st.stop()
 
-            deposit_pct = round((deposit_paid_val / quoted_price_val) * 100, 2) if quoted_price_val > 0 else 0.0
+            quoted_price = st.number_input("Quoted Price *", min_value=0.0, format="%.2f", key="quoted_price_input")
+            deposit_paid = st.number_input("Deposit Paid *", min_value=0.0, format="%.2f", key="deposit_paid_input")
+            deposit_pct_preview = round((deposit_paid / quoted_price) * 100, 2) if quoted_price > 0 else 0.0
+            st.caption(f"Deposit %: {deposit_pct_preview:.2f}%")
 
-            new_row = {
-                "QuoteID": new_id,
-                "Client": client,
-                "QuotedPrice": quoted_price_val,
-                "Status": status,
-                "SalesRep": sales_rep,
-                "Deposit%": deposit_pct,
-                "DepositPaid": deposit_paid_val,
-                "SentDate": sent_date,
-                "JobType": job_type
-            }
-            sales = pd.concat([sales, pd.DataFrame([new_row])], ignore_index=True)
+            client = st.text_input("Client *")
+            status = st.selectbox("Status *", ["Sent", "Won", "Lost"])
+            sales_rep = st.text_input("Sales Rep *")
+            sent_date = st.date_input("Sent Date *")
+            job_type = st.text_input("Job Type *")
 
-            if deposit_paid_val and deposit_paid_val > 0:
-                collections = pd.concat([collections, pd.DataFrame([{
-                    "QuoteID": new_id,
-                    "CollectionDate": sent_date,
-                    "Client": client,
-                    "DepositPaid": deposit_paid_val,
-                    "BalanceDue": max(quoted_price_val - deposit_paid_val, 0.0),
-                    "Status": "Partially Paid" if deposit_paid_val < quoted_price_val else "Paid",
-                }])], ignore_index=True)
+            submitted = st.form_submit_button("Add Sale")
 
-            sales = sync_deposit_paid(sales, collections)
-            collections = update_balance_due(sales, collections)
-            if save_data(sales, collections, assignments):
-                sales, collections, assignments = load_data()
-                st.session_state["sale_added"] = new_row
-                st.rerun()
+        if submitted:
+            quoted_price_val = st.session_state.get("quoted_price_input", 0.0)
+            deposit_paid_val = st.session_state.get("deposit_paid_input", 0.0)
+
+            if not client or not sales_rep or not job_type:
+                st.error("⚠️ All fields are required. Please fill them in.")
             else:
-                st.stop()
+                # Use Area from the selectbox outside the form
+                area = st.session_state["area_select"]
+
+                # Enforce unique Quote ID
+                new_id = int(st.session_state["quote_id_input"])
+                existing_ids = set(
+                    pd.to_numeric(sales.get("QuoteID", pd.Series([], dtype=int)), errors="coerce")
+                    .fillna(0).astype(int).tolist()
+                )
+                if new_id in existing_ids:
+                    st.error(
+                        f"⚠️ Quote ID {new_id} already exists. "
+                        f"Try another (suggested: {generate_unique_quote_id(area, sales)})."
+                    )
+                    st.stop()
+
+                deposit_pct = round((deposit_paid_val / quoted_price_val) * 100, 2) if quoted_price_val > 0 else 0.0
+
+                new_row = {
+                    "QuoteID": new_id,
+                    "Client": client,
+                    "QuotedPrice": quoted_price_val,
+                    "Status": status,
+                    "SalesRep": sales_rep,
+                    "Deposit%": deposit_pct,
+                    "DepositPaid": deposit_paid_val,
+                    "SentDate": sent_date,
+                    "JobType": job_type
+                }
+                sales = pd.concat([sales, pd.DataFrame([new_row])], ignore_index=True)
+
+                if deposit_paid_val and deposit_paid_val > 0:
+                    collections = pd.concat([collections, pd.DataFrame([{
+                        "QuoteID": new_id,
+                        "CollectionDate": sent_date,
+                        "Client": client,
+                        "DepositPaid": deposit_paid_val,
+                        "BalanceDue": max(quoted_price_val - deposit_paid_val, 0.0),
+                        "Status": "Partially Paid" if deposit_paid_val < quoted_price_val else "Paid",
+                    }])], ignore_index=True)
+
+                sales = sync_deposit_paid(sales, collections)
+                collections = update_balance_due(sales, collections)
+                if save_data(sales, collections, assignments):
+                    sales, collections, assignments = load_data()
+                    st.session_state["sale_added"] = new_row
+                    st.rerun()
+                else:
+                    st.stop()
 
 
     # Always show all sales at the bottom
