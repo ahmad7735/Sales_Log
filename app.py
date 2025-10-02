@@ -164,17 +164,14 @@ def save_data(sales, collections, assignments):
 
 # ---------------- Derivations ----------------
 def build_filters_ui(df: pd.DataFrame, key_prefix: str, date_col: str = "SentDate"):
-    """Render sidebar filters and return (filtered_df, selected_rep, start_date, end_date)."""
     st.sidebar.subheader("Filters")
     selected_rep, start_date, end_date = "All", None, None
 
-    # Sales Rep
     reps = ["All"]
     if "SalesRep" in df.columns:
         reps += sorted(df["SalesRep"].dropna().unique().tolist())
     selected_rep = st.sidebar.selectbox("Sales Rep", reps, key=f"{key_prefix}_rep")
 
-    # Date + Quick Range (based on date_col)
     if date_col in df.columns and pd.api.types.is_datetime64_any_dtype(df[date_col]):
         valid_dates = df[date_col].dropna()
         if not valid_dates.empty:
@@ -182,13 +179,18 @@ def build_filters_ui(df: pd.DataFrame, key_prefix: str, date_col: str = "SentDat
             max_date = valid_dates.max().date()
 
             picked = st.sidebar.date_input(
-                "Select Date Range", [min_date, max_date], key=f"{key_prefix}_date_range"
+                "Select Date Range",
+                [min_date, max_date],
+                key=f"{key_prefix}_date_range"
             )
             quick = st.sidebar.selectbox(
                 "Quick Range",
-                ["Choose Quick Range", "Last 7 days", "Last 30 days", "Last 90 days",
-                 "This month (MTD)", "Last month", "Year to date (YTD)"],
-                index=0, key=f"{key_prefix}_quick"
+                [
+                    "Choose Quick Range", "Last 7 days", "Last 30 days", "Last 90 days",
+                    "This month (MTD)", "Last month", "Year to date (YTD)"
+                ],
+                index=0,
+                key=f"{key_prefix}_quick"
             )
 
             today = pd.Timestamp.today().normalize()
@@ -208,20 +210,20 @@ def build_filters_ui(df: pd.DataFrame, key_prefix: str, date_col: str = "SentDat
             elif quick == "Year to date (YTD)":
                 start_date, end_date = pd.Timestamp(today.year, 1, 1).date(), today.date()
             else:
-                if isinstance(picked, list) and len(picked) == 2:
-                    start_date, end_date = picked
+                # ACCEPT tuple **or** list from date_input
+                if isinstance(picked, (list, tuple)) and len(picked) == 2:
+                    start_date, end_date = picked[0], picked[1]
 
-    # Apply filters
     filtered = df.copy()
     if selected_rep != "All" and "SalesRep" in filtered.columns:
         filtered = filtered[filtered["SalesRep"] == selected_rep]
-    if start_date and end_date and date_col in filtered.columns:
-        filtered = filtered[
-            (filtered[date_col] >= pd.to_datetime(start_date)) &
-            (filtered[date_col] <= pd.to_datetime(end_date))
-        ]
 
-    # Save in session for reuse after mid-page reloads
+    if start_date and end_date and date_col in filtered.columns:
+        # Optional: make end date inclusive even if your datetime has times
+        start_ts = pd.to_datetime(start_date)
+        end_ts = pd.to_datetime(end_date) + pd.Timedelta(days=1) - pd.Timedelta(nanoseconds=1)
+        filtered = filtered[(filtered[date_col] >= start_ts) & (filtered[date_col] <= end_ts)]
+
     st.session_state[f"{key_prefix}_filters"] = {"rep": selected_rep, "start": start_date, "end": end_date}
     return filtered, selected_rep, start_date, end_date
 
@@ -640,6 +642,31 @@ if page == "Sales Log":
             st.session_state["quote_id_input"] = int(generate_unique_quote_id(area, sales))
             st.session_state["last_area"] = area
 
+        # --- Sales Rep options for the form ---
+        rep_options = []
+
+        if "SalesRep" in sales.columns:
+            rep_options = (
+                sales["SalesRep"]
+                .dropna()
+                .astype(str)
+                .str.strip()
+                .replace("", pd.NA)
+                .dropna()
+                .unique()
+                .tolist()
+            )
+
+        # Make sure "Jonas Ofori" is present and at the top
+        if "Jonas Ofori" not in rep_options:
+            rep_options = ["Jonas Ofori"] + rep_options
+        else:
+            # Move "Jonas Ofori" to the front
+            rep_options = ["Jonas Ofori"] + [r for r in rep_options if r != "Jonas Ofori"]
+
+        # Add UI helpers
+        rep_options = ["Select"] + rep_options
+        
         # ---- Single, non-nested form for the rest of the fields ----
         with st.form("add_sale_form"):
             # Editable Quote ID (bound to the same key; no `value=` to avoid the warning)
@@ -658,7 +685,12 @@ if page == "Sales Log":
 
             client = st.text_input("Client *")
             status = st.selectbox("Status *", ["Sent", "Won", "Lost"])
-            sales_rep = st.text_input("Sales Rep *")
+            sales_rep_choice = st.selectbox("Sales Rep *", rep_options, index=1)
+            if sales_rep_choice == "Other…":
+                sales_rep = st.text_input("Enter Sales Rep", key="sales_rep_other").strip()
+            else:
+                sales_rep = "" if sales_rep_choice == "— Select —" else sales_rep_choice
+
             sent_date = st.date_input("Sent Date *")
             job_type = st.text_input("Job Type *")
 
