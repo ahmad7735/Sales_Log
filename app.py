@@ -11,155 +11,165 @@ import requests
 from io import BytesIO
 
 
-def _gh_conf():
-    g = st.secrets["github"]
-    return g["token"], g["repo"], g["branch"], g["file_path"]
+import base64, json, requests
 
-def _raw_url(repo, branch, file_path):
-    # Raw endpoint works even without a token for public repos
-    return f"https://raw.githubusercontent.com/{repo}/{branch}/{file_path}"
+# ---- SETTINGS (from Streamlit secrets) ----
+# Add these keys in Streamlit Cloud (Settings → Secrets):
+# [github]
+# repo = "ahmad7735/Sales_Log"
+# branch = "main"            # set to "main" OR "master" EXACTLY as your repo shows
+# file_path = "data.xlsx"    # JUST the path in the repo (no https://…)
+# token = "ghp_... or github_pat_..."  # OPTIONAL for PRIVATE repo
 
-def _contents_url(repo, file_path):
-    return f"https://api.github.com/repos/{repo}/contents/{file_path}"
-
-def read_excel_from_github():
-    token, repo, branch, file_path = _gh_conf()
-
-    # 1) Try raw.githubusercontent.com (fast path)
-    raw = _raw_url(repo, branch, file_path)
-    r = requests.get(raw, timeout=20)
-    if r.status_code == 200:
-        return pd.ExcelFile(io.BytesIO(r.content))
-
-    # 2) Fallback to GitHub Contents API (works for private repos too)
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-    }
-    params = {"ref": branch}
-    r = requests.get(_contents_url(repo, file_path), headers=headers, params=params, timeout=20)
-    if r.status_code != 200:
-        raise RuntimeError(
-            f"Failed to download Excel from GitHub: {r.status_code} {r.text}. "
-            f"Checked raw URL: {raw} and contents API for {repo}@{branch}/{file_path}."
-        )
-    data = r.json()
-    content_b64 = data.get("content", "")
-    xls_bytes = base64.b64decode(content_b64)
-    return pd.ExcelFile(io.BytesIO(xls_bytes))
-
-def write_excel_to_github(sales, collections, assignments, commit_message="Update data.xlsx"):
-    token, repo, branch, file_path = _gh_conf()
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-    }
-    url = _contents_url(repo, file_path)
-
-    # 1) Get current SHA (required by GitHub for updates)
-    params = {"ref": branch}
-    r = requests.get(url, headers=headers, params=params, timeout=20)
-    if r.status_code not in (200, 404):
-        st.error(f"GitHub GET failed: {r.status_code} {r.text}")
-        return False
-    sha = r.json()["sha"] if r.status_code == 200 else None
-
-    # 2) Build the new Excel file in-memory
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl", mode="w") as writer:
-        sales.to_excel(writer, sheet_name="SalesLog", index=False)
-        collections.to_excel(writer, sheet_name="Collections", index=False)
-        assignments.to_excel(writer, sheet_name="Assignments", index=False)
-    buf.seek(0)
-    content_b64 = base64.b64encode(buf.read()).decode("utf-8")
-
-    # 3) PUT the new content
-    payload = {
-        "message": commit_message,
-        "content": content_b64,
-        "branch": branch,
-    }
-    if sha:
-        payload["sha"] = sha
-
-    r = requests.put(url, headers=headers, data=json.dumps(payload), timeout=30)
-    if r.status_code not in (200, 201):
-        st.error(f"GitHub PUT failed: {r.status_code} {r.text}")
-        return False
-    return True
-
-
-
-
-
-
-# ---------------- Data IO ----------------
-# Removing @st.cache_data to avoid caching issues
 def _gh_headers():
-    return {
-        "Authorization": f"Bearer {st.secrets['github']['token']}",
-        "Accept": "application/vnd.github+json",
-    }
+    token = st.secrets.get("github", {}).get("token", "")
+    h = {"Accept": "application/vnd.github+json"}
+    if token:
+        h["Authorization"] = f"Bearer {token}"
+    return h
 
-def _gh_repo_info():
-    return (
-        st.secrets["github"]["repo"],
-        st.secrets["github"]["branch"],
-        st.secrets["github"]["file_path"],
+def _gh_api_base():
+    repo = st.secrets["github"]["repo"]
+    return f"https://api.github.com/repos/{repo}"
+
+def read_excel_from_github() -> bytes:
+    """Return the Excel file bytes from GitHub (public or private)."""
+    cfg = st.secrets.get("github", {})
+    repo = cfg.get("repo")
+    branch = cfg.get("branch", "main")
+    rel_path = cfg.get("file_path", "data.xlsx")
+    if not repo:
+        raise RuntimeError("GitHub repo not configured in secrets: [github].repo is missing.")
+
+    # 1) Try GitHub Contents API (works for private & public)
+    url = f"{_gh_api_base()}/contents/{rel_path}?ref={branch}"
+    r = requests.get(url, headers=_gh_headers(), timeout=20)
+    if r.status_code == 200:
+        data = r.json()
+        if data.get("encoding") == "base64":
+            return base64.b64decode(data["content"])
+        else:
+            # Some proxies return raw bytes; handle that too
+            content = data.get("content")
+            if content:
+                return base64.b64decode(content)
+            raise RuntimeError("Unexpected GitHub response: no base64 content.")
+    # 2) If that failed AND the repo is public, try raw URL without token
+    raw_url = f"https://raw.githubusercontent.com/{repo}/{branch}/{rel_path}"
+    r2 = requests.get(raw_url, timeout=20)
+    if r2.status_code == 200:
+        return r2.content
+
+    # Surface helpful error message
+    raise RuntimeError(
+        "Failed to download Excel from GitHub.\n"
+        f"Contents API: {r.status_code} {r.text[:200]}\n"
+        f"Raw URL: {r2.status_code} {r2.text[:200]}"
     )
 
-def read_excel_from_github() -> BytesIO:
-    """Download data.xlsx bytes from GitHub and return a BytesIO."""
-    repo, branch, path = _gh_repo_info()
-    # Raw file contents API
-    url = f"https://raw.githubusercontent.com/{repo}/{branch}/{path}"
-    r = requests.get(url, headers={"Accept": "application/octet-stream"})
-    if r.status_code != 200:
-        raise RuntimeError(f"Failed to download Excel from GitHub: {r.status_code} {r.text}")
-    return BytesIO(r.content)
+def write_excel_to_github(file_bytes: bytes, commit_message="Update data.xlsx"):
+    """Create/update data.xlsx in repo via GitHub API (requires token with 'repo' scope for private)."""
+    cfg = st.secrets["github"]
+    repo   = cfg["repo"]
+    branch = cfg.get("branch", "main")
+    path   = cfg.get("file_path", "data.xlsx")
 
-def _get_file_sha(repo: str, path: str, branch: str) -> str | None:
-    """Get the current blob SHA for the file (needed to update). Returns None if file doesn’t exist."""
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-    params = {"ref": branch}
-    r = requests.get(url, headers=_gh_headers(), params=params)
-    if r.status_code == 200:
-        return r.json().get("sha")
-    elif r.status_code == 404:
-        return None
-    else:
-        raise RuntimeError(f"Failed to fetch file sha: {r.status_code} {r.text}")
+    # 1) Get current file SHA (required for update; not required for create)
+    get_url = f"{_gh_api_base()}/contents/{path}"
+    get_params = {"ref": branch}
+    g = requests.get(get_url, headers=_gh_headers(), params=get_params, timeout=20)
+    sha = g.json().get("sha") if g.status_code == 200 else None
 
-def commit_excel_to_github(excel_bytes: bytes, commit_message: str) -> None:
-    """Create or update data.xlsx in the repo on the configured branch."""
-    repo, branch, path = _gh_repo_info()
-    sha = _get_file_sha(repo, path, branch)
-
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
+    # 2) Create or update the file
+    put_url = f"{_gh_api_base()}/contents/{path}"
     payload = {
         "message": commit_message,
-        "content": base64.b64encode(excel_bytes).decode("utf-8"),
-        "branch": branch,
+        "content": base64.b64encode(file_bytes).decode("utf-8"),
+        "branch": branch
     }
     if sha:
-        payload["sha"] = sha  # required to update an existing file
+        payload["sha"] = sha  # include for update
 
-    r = requests.put(url, headers=_gh_headers(), data=json.dumps(payload))
-    if r.status_code not in (200, 201):
-        raise RuntimeError(f"GitHub commit failed: {r.status_code} {r.text}")
+    p = requests.put(put_url, headers=_gh_headers(), data=json.dumps(payload), timeout=30)
+    if p.status_code not in (200, 201):
+        raise RuntimeError(f"GitHub write failed: {p.status_code} {p.text[:500]}")
+
 
 def load_data():
-    xls = read_excel_from_github()
-    sales = pd.read_excel(xls, sheet_name="SalesLog")
+    # Try GitHub first
+    try:
+        xls_bytes = read_excel_from_github()
+        xls = pd.ExcelFile(io.BytesIO(xls_bytes))
+    except Exception as e:
+        st.warning(f"GitHub read failed; falling back to local file. Details: {e}")
+        xls = pd.ExcelFile(EXCEL_FILE)  # ensure data.xlsx is present locally on first run
+
+    sales       = pd.read_excel(xls, sheet_name="SalesLog")
     collections = pd.read_excel(xls, sheet_name="Collections")
     assignments = pd.read_excel(xls, sheet_name="Assignments")
+ # after: assignments = pd.read_excel(EXCEL_FILE, sheet_name="Assignments")
+
+    # Make sure we have Completed (bool) and TaskStatus (str)
+    if "Completed" not in assignments.columns:
+        assignments["Completed"] = False
+    else:
+        assignments["Completed"] = assignments["Completed"].astype(bool)
+
+    if "TaskStatus" not in assignments.columns:
+        # default to "Not started" for open rows, "Completed" for completed rows
+        assignments["TaskStatus"] = assignments["Completed"].map(lambda x: "Completed" if x else "Not started")
+    else:
+        assignments["TaskStatus"] = assignments["TaskStatus"].astype(str)
+
+    # NEW: guarantee + normalize the CollectionDate column
+    if "CollectionDate" not in collections.columns:
+        collections["CollectionDate"] = pd.NaT
+    else:
+        collections["CollectionDate"] = pd.to_datetime(collections["CollectionDate"], errors="coerce")
+
+    # Ensure numeric
+    sales["QuotedPrice"] = pd.to_numeric(sales.get("QuotedPrice", 0), errors="coerce").fillna(0)
+    sales["DepositPaid"] = pd.to_numeric(sales.get("DepositPaid", 0), errors="coerce").fillna(0)
+    collections["QuoteID"] = pd.to_numeric(collections.get("QuoteID", 0), errors="coerce")
+    collections["DepositPaid"] = pd.to_numeric(collections.get("DepositPaid", 0), errors="coerce").fillna(0)
+
+    # Ensure dates
+    if "SentDate" in sales.columns:
+        sales["SentDate"] = pd.to_datetime(sales["SentDate"], errors="coerce")
+        
+    # Ensure QuoteID column exists
+    if "QuoteID" not in sales.columns:
+        sales["QuoteID"] = pd.Series(dtype="int")
+
+    # Normalize QuoteID
+    sales["QuoteID"] = pd.to_numeric(sales["QuoteID"], errors="coerce").fillna(0).astype(int)
+    collections["QuoteID"] = pd.to_numeric(collections["QuoteID"], errors="coerce").fillna(0).astype(int)
+
+    # 🚫 Drop DepositDue if still present in file
+    collections = collections.drop(columns=["DepositDue"], errors="ignore")
+
+    # Ensure Status exists
+    if "Status" not in collections.columns:
+        collections["Status"] = ""
     return sales, collections, assignments
 
 def save_data(sales, collections, assignments):
-    ok = write_excel_to_github(sales, collections, assignments, commit_message="Update data.xlsx via app")
-    if not ok:
-        st.error("Failed to save to GitHub.")
-    return ok
+    try:
+        # 1) Write to an in-memory Excel file
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl", mode="w") as writer:
+            sales.to_excel(writer, sheet_name="SalesLog", index=False)
+            collections.to_excel(writer, sheet_name="Collections", index=False)
+            assignments.to_excel(writer, sheet_name="Assignments", index=False)
+            # (optional) your openpyxl formatting here if you want, but keep it quick for cloud
+        buf.seek(0)
+
+        # 2) Push to GitHub
+        write_excel_to_github(buf.read(), commit_message="Update data.xlsx via Streamlit app")
+        return True
+    except Exception as e:
+        st.error(f"💥 Save failed: {type(e).__name__}: {e}")
+        return False
 
 
 
