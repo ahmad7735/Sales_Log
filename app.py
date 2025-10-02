@@ -1,124 +1,165 @@
-import os
-import io
-import time
-import tempfile
-import matplotlib.pyplot as plt
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
+import io
+import os
+import tempfile
 
-# --- DB imports ---
-from sqlalchemy import create_engine, text
 
-# ========== Database engine (Neon) ==========
-# Put your URL in Streamlit Secrets:
-# [database]
-# url = "postgresql://<user>:<password>@<host>/<db>?sslmode=require"
-#
-# Or, set an env var DATABASE_URL on Streamlit Cloud.
-DATABASE_URL = (
-    st.secrets.get("database", {}).get("url")
-    or os.environ.get("DATABASE_URL")
-    # Temporary fallback (not recommended). Prefer secrets/env var:
-    # "postgresql://neondb_owner:***@ep-....neon.tech/neondb?sslmode=require"
-)
-if not DATABASE_URL:
-    st.stop()  # hard stop with a clear message on the page
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# File path
+EXCEL_FILE = "data.xlsx"
+# Defaults to satisfy static analyzer; real values set in each page’s UI
+selected_rep = "All"
+start_date = end_date = None
 
-# Optional: create tables if they don't exist (safe to run each boot)
-def _init_schema():
-    with engine.begin() as conn:
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS saleslog (
-            "QuoteID"     INTEGER PRIMARY KEY,
-            "Client"      TEXT,
-            "QuotedPrice" DOUBLE PRECISION DEFAULT 0,
-            "Status"      TEXT,
-            "SalesRep"    TEXT,
-            "Deposit%"    DOUBLE PRECISION DEFAULT 0,
-            "DepositPaid" DOUBLE PRECISION DEFAULT 0,
-            "SentDate"    DATE,
-            "JobType"     TEXT
-        );
-        """))
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS collections (
-            id             BIGSERIAL PRIMARY KEY,
-            "QuoteID"      INTEGER REFERENCES saleslog("QuoteID") ON DELETE CASCADE,
-            "CollectionDate" DATE,
-            "Client"       TEXT,
-            "DepositPaid"  DOUBLE PRECISION DEFAULT 0,
-            "BalanceDue"   DOUBLE PRECISION DEFAULT 0,
-            "Status"       TEXT
-        );
-        """))
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS assignments (
-            id         BIGSERIAL PRIMARY KEY,
-            "QuoteID"  INTEGER REFERENCES saleslog("QuoteID") ON DELETE CASCADE,
-            "Client"   TEXT,
-            "CrewMember" TEXT,
-            "StartDate"  DATE,
-            "EndDate"    DATE,
-            "Payment"    DOUBLE PRECISION DEFAULT 0,
-            "DaysTaken"  INTEGER DEFAULT 0,
-            "Notes"      TEXT,
-            "Completed"  BOOLEAN DEFAULT FALSE,
-            "TaskStatus" TEXT
-        );
-        """))
-_init_schema()
 
 # ---------------- Data IO ----------------
+# Removing @st.cache_data to avoid caching issues
 def load_data():
-    with engine.begin() as conn:
-        sales = pd.read_sql(
-            'SELECT * FROM "saleslog"',
-            conn,
-            parse_dates=["SentDate"]
-        )
-        collections = pd.read_sql(
-            'SELECT * FROM "collections"',
-            conn,
-            parse_dates=["CollectionDate"]
-        )
-        assignments = pd.read_sql(
-            'SELECT * FROM "assignments"',
-            conn,
-            parse_dates=["StartDate", "EndDate"]
-        )
-    # normalize types to match your app’s expectations
-    if "QuoteID" in sales.columns:
-        sales["QuoteID"] = pd.to_numeric(sales["QuoteID"], errors="coerce").fillna(0).astype(int)
-    if "QuoteID" in collections.columns:
-        collections["QuoteID"] = pd.to_numeric(collections["QuoteID"], errors="coerce").fillna(0).astype(int)
+    sales = pd.read_excel(EXCEL_FILE, sheet_name="SalesLog")
+    collections = pd.read_excel(EXCEL_FILE, sheet_name="Collections")
+    assignments = pd.read_excel(EXCEL_FILE, sheet_name="Assignments")
+    # after: assignments = pd.read_excel(EXCEL_FILE, sheet_name="Assignments")
+
+    # Make sure we have Completed (bool) and TaskStatus (str)
+    if "Completed" not in assignments.columns:
+        assignments["Completed"] = False
+    else:
+        assignments["Completed"] = assignments["Completed"].astype(bool)
+
+    if "TaskStatus" not in assignments.columns:
+        # default to "Not started" for open rows, "Completed" for completed rows
+        assignments["TaskStatus"] = assignments["Completed"].map(lambda x: "Completed" if x else "Not started")
+    else:
+        assignments["TaskStatus"] = assignments["TaskStatus"].astype(str)
+
+    # NEW: guarantee + normalize the CollectionDate column
+    if "CollectionDate" not in collections.columns:
+        collections["CollectionDate"] = pd.NaT
+    else:
+        collections["CollectionDate"] = pd.to_datetime(collections["CollectionDate"], errors="coerce")
+
+    # Ensure numeric
+    sales["QuotedPrice"] = pd.to_numeric(sales.get("QuotedPrice", 0), errors="coerce").fillna(0)
+    sales["DepositPaid"] = pd.to_numeric(sales.get("DepositPaid", 0), errors="coerce").fillna(0)
+    collections["QuoteID"] = pd.to_numeric(collections.get("QuoteID", 0), errors="coerce")
+    collections["DepositPaid"] = pd.to_numeric(collections.get("DepositPaid", 0), errors="coerce").fillna(0)
+
+    # Ensure dates
+    if "SentDate" in sales.columns:
+        sales["SentDate"] = pd.to_datetime(sales["SentDate"], errors="coerce")
+        
+    # Ensure QuoteID column exists
+    if "QuoteID" not in sales.columns:
+        sales["QuoteID"] = pd.Series(dtype="int")
+
+    # Normalize QuoteID
+    sales["QuoteID"] = pd.to_numeric(sales["QuoteID"], errors="coerce").fillna(0).astype(int)
+    collections["QuoteID"] = pd.to_numeric(collections["QuoteID"], errors="coerce").fillna(0).astype(int)
+
+    # 🚫 Drop DepositDue if still present in file
+    collections = collections.drop(columns=["DepositDue"], errors="ignore")
+
+    # Ensure Status exists
+    if "Status" not in collections.columns:
+        collections["Status"] = ""
+
     return sales, collections, assignments
 
 
-def save_data(sales: pd.DataFrame, collections: pd.DataFrame, assignments: pd.DataFrame) -> bool:
+def save_data(sales, collections, assignments):
+    SALES_ORDER = ["QuoteID", "Client", "QuotedPrice", "Status", "SalesRep",
+                   "Deposit%", "DepositPaid", "SentDate", "JobType"]
+    # No DepositDue here ✅
+    COLLECTIONS_ORDER = ["QuoteID", "CollectionDate", "Client", "DepositPaid", "BalanceDue", "Status"]
+
+    # Normalize key columns
+    for df in (sales, collections, assignments):
+        if "QuoteID" in df.columns:
+            df["QuoteID"] = pd.to_numeric(df["QuoteID"], errors="coerce").fillna(0).astype(int)
+
+    def ensure_and_order(df, desired, fill_defaults=None):
+        df = df.copy()
+        fill_defaults = fill_defaults or {}
+        # make sure desired cols exist
+        for col in desired:
+            if col not in df.columns:
+                df[col] = fill_defaults.get(col, pd.NA)
+        # drop DepositDue explicitly if present
+        if "DepositDue" in df.columns:
+            df = df.drop(columns=["DepositDue"])
+        # order: desired first, then extras
+        extras = [c for c in df.columns if c not in desired]
+        return df[desired + extras]
+
+    sales_to_save = ensure_and_order(
+        sales, SALES_ORDER,
+        fill_defaults={"Deposit%": 0.0, "DepositPaid": 0.0}
+    )
+    collections_to_save = ensure_and_order(
+        collections, COLLECTIONS_ORDER,
+        fill_defaults={"DepositPaid": 0.0, "BalanceDue": 0.0, "Status": ""}
+    )
+    assignments_to_save = assignments.copy()
+
+    dir_name = os.path.dirname(os.path.abspath(EXCEL_FILE))
+    base_name = os.path.basename(EXCEL_FILE)
+    tmp_path = None
+
     try:
-        # Ensure numeric primary/foreign keys before write
-        if "QuoteID" in sales.columns:
-            sales["QuoteID"] = pd.to_numeric(sales["QuoteID"], errors="coerce").fillna(0).astype(int)
-        if "QuoteID" in collections.columns:
-            collections["QuoteID"] = pd.to_numeric(collections["QuoteID"], errors="coerce").fillna(0).astype(int)
-        if "QuoteID" in assignments.columns:
-            assignments["QuoteID"] = pd.to_numeric(assignments["QuoteID"], errors="coerce").fillna(0).astype(int)
+        with tempfile.NamedTemporaryFile(delete=False, dir=dir_name, prefix=base_name, suffix=".xlsx") as tmp:
+            tmp_path = tmp.name
 
-        with engine.begin() as conn:
-            # Replace-all (simple drop-in for your current Excel logic)
-            conn.execute(text('TRUNCATE "assignments", "collections", "saleslog" RESTART IDENTITY;'))
+        with pd.ExcelWriter(tmp_path, engine="openpyxl", mode="w") as writer:
+            sales_to_save.to_excel(writer, sheet_name="SalesLog", index=False)
+            collections_to_save.to_excel(writer, sheet_name="Collections", index=False)
+            assignments_to_save.to_excel(writer, sheet_name="Assignments", index=False)
 
-            # Write back in dependency order: saleslog first (FK target), then collections/assignments
-            sales.to_sql("saleslog", conn, if_exists="append", index=False)
-            collections.to_sql("collections", conn, if_exists="append", index=False)
-            assignments.to_sql("assignments", conn, if_exists="append", index=False)
+            # >>> Apply Excel number formats (currency + date + percent display) <<<
+            from openpyxl.utils import get_column_letter
+
+            wb = writer.book
+            ws_sales = writer.sheets["SalesLog"]
+            ws_col = writer.sheets["Collections"]
+
+            currency_fmt = '"$"#,##0.00'
+            date_fmt = 'yyyy-mm-dd'
+            percent_literal_fmt = '0.00"%"'  # shows 20 as 20.00% (no scaling)
+
+            def format_column(ws, df, col_name, num_fmt):
+                if col_name in df.columns:
+                    col_idx = df.columns.get_loc(col_name) + 1  # 1-based
+                    col_letter = get_column_letter(col_idx)
+                    # skip header at row 1
+                    for cell in ws[col_letter][1:]:
+                        cell.number_format = num_fmt
+
+            # SalesLog: $ for money, date-only for dates, literal % for Deposit%
+            format_column(ws_sales, sales_to_save, "QuotedPrice", currency_fmt)
+            format_column(ws_sales, sales_to_save, "DepositPaid", currency_fmt)
+            format_column(ws_sales, sales_to_save, "SentDate", date_fmt)
+            format_column(ws_sales, sales_to_save, "Deposit%", percent_literal_fmt)
+
+            # Collections: $ for money
+            format_column(ws_col, collections_to_save, "DepositPaid", currency_fmt)
+            format_column(ws_col, collections_to_save, "BalanceDue", currency_fmt)
+            format_column(ws_col, collections_to_save, "CollectionDate", date_fmt)
+
+            
+
+        os.replace(tmp_path, os.path.abspath(EXCEL_FILE))  # atomic replace
         return True
+    except PermissionError:
+        st.error("⚠️ Could not save data. Please close 'data.xlsx' (Excel might have it open) and try again.")
     except Exception as e:
-        st.error(f"DB save failed: {type(e).__name__}: {e}")
-        return False
+        st.error(f"💥 Save failed: {type(e).__name__}: {e}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except Exception: pass
+    return False
 
-# ---------------- Derivations ----------------
 
 
 # ---------------- Derivations ----------------
@@ -205,86 +246,81 @@ def apply_saved_filters(df: pd.DataFrame, key_prefix: str, date_col: str = "Sent
 def sync_deposit_paid(sales: pd.DataFrame, collections: pd.DataFrame) -> pd.DataFrame:
     """
     Make Sales.DepositPaid = SUM(Collections.DepositPaid) per QuoteID.
-    Safe with empty/missing columns on first boot.
+    This avoids double counting and keeps Sales as the single source of truth for totals.
     """
-    s = (sales.copy() if isinstance(sales, pd.DataFrame) else pd.DataFrame())
-    c = (collections.copy() if isinstance(collections, pd.DataFrame) else pd.DataFrame())
+    s = sales.copy()
+    c = collections.copy()
 
-    # Ensure required cols exist with correct dtypes
-    if "QuoteID" not in s.columns:
-        s["QuoteID"] = pd.Series(dtype="int64")
-    if "QuotedPrice" not in s.columns:
-        s["QuotedPrice"] = 0.0
-    if "DepositPaid" not in s.columns:
-        s["DepositPaid"] = 0.0
+    # Normalize
+    for df in (s, c):
+        if "QuoteID" in df.columns:
+            df["QuoteID"] = pd.to_numeric(df["QuoteID"], errors="coerce").fillna(0).astype(int)
 
-    if "QuoteID" not in c.columns:
-        c["QuoteID"] = pd.Series(dtype="int64")
-    if "DepositPaid" not in c.columns:
-        c["DepositPaid"] = 0.0
-
-    # Normalize dtypes
-    s["QuoteID"]    = pd.to_numeric(s["QuoteID"], errors="coerce").fillna(0).astype(int)
-    s["QuotedPrice"]= pd.to_numeric(s["QuotedPrice"], errors="coerce").fillna(0.0)
-    s["DepositPaid"]= pd.to_numeric(s["DepositPaid"], errors="coerce").fillna(0.0)
-    c["QuoteID"]    = pd.to_numeric(c["QuoteID"], errors="coerce").fillna(0).astype(int)
-    c["DepositPaid"]= pd.to_numeric(c["DepositPaid"], errors="coerce").fillna(0.0)
+    s["QuotedPrice"]   = pd.to_numeric(s.get("QuotedPrice", 0), errors="coerce").fillna(0.0)
+    c["DepositPaid"]   = pd.to_numeric(c.get("DepositPaid", 0), errors="coerce").fillna(0.0)
 
     # Sum every collection (initial + follow-ups) per QuoteID
-    if not c.empty and "QuoteID" in c.columns and "DepositPaid" in c.columns:
-        sums = c.groupby("QuoteID", dropna=False)["DepositPaid"].sum(min_count=1)
-    else:
-        sums = pd.Series(dtype=float)
-
+    sums = c.groupby("QuoteID", dropna=False)["DepositPaid"].sum(min_count=1)
     s["DepositPaid"] = s["QuoteID"].map(sums).fillna(0.0).astype(float)
 
     # Recompute %
     s["Deposit%"] = s.apply(
-        lambda r: round((r["DepositPaid"] / r["QuotedPrice"]) * 100, 2) if float(r["QuotedPrice"]) > 0 else 0.0,
+        lambda r: round((r["DepositPaid"] / r["QuotedPrice"]) * 100, 2) if r["QuotedPrice"] > 0 else 0.0,
         axis=1
     )
     return s
 
 
+    # (unused legacy code below intentionally preserved but never reached)
+    merged = c.merge(
+        s[["QuoteID", "DepositPaid"]].rename(columns={"DepositPaid": "InitialDeposit"}),
+        on="QuoteID", how="left"
+    )
+    merged["InitialDeposit"] = pd.to_numeric(merged["InitialDeposit"], errors="coerce").fillna(0.0)
+    raw_sum = merged.groupby("QuoteID")["DepositPaid"].sum()
+    has_legacy = (
+        (merged["DepositPaid"].round(2) == merged["InitialDeposit"].round(2))
+        .groupby(merged["QuoteID"])
+        .any()
+    )
+    initial_map = s.set_index("QuoteID")["DepositPaid"]
+    adj_sum = raw_sum - initial_map.where(has_legacy, 0.0)
+    adj_sum = adj_sum.reindex(s["QuoteID"].unique(), fill_value=0.0)
+    total_paid = initial_map.add(adj_sum, fill_value=0.0)
+    s = s.set_index("QuoteID")
+    s.loc[total_paid.index, "DepositPaid"] = total_paid.values
+    s["Deposit%"] = s.apply(
+        lambda r: round((r["DepositPaid"] / r["QuotedPrice"]) * 100, 2) if r["QuotedPrice"] > 0 else 0.0,
+        axis=1
+    )
+    return s.reset_index()
+
+
+
 def update_balance_due(sales: pd.DataFrame, collections: pd.DataFrame) -> pd.DataFrame:
     """
-    BalanceDue per QuoteID = QuotedPrice - Sales.DepositPaid.
-    Safe with empty/missing columns on first boot.
+    BalanceDue per QuoteID = QuotedPrice - Sales.DepositPaid  (Sales.DepositPaid is TOTAL to date).
     """
-    s = (sales.copy() if isinstance(sales, pd.DataFrame) else pd.DataFrame())
-    c = (collections.copy() if isinstance(collections, pd.DataFrame) else pd.DataFrame())
-
-    # Ensure required cols exist with correct dtypes
-    for col, default in [("QuoteID", pd.Series(dtype="int64")),
-                         ("QuotedPrice", 0.0),
-                         ("DepositPaid", 0.0)]:
-        if col not in s.columns:
-            s[col] = default
-
-    if "QuoteID" not in c.columns:
-        c["QuoteID"] = pd.Series(dtype="int64")
+    s = sales.copy()
+    c = collections.copy()
 
     # Normalize
-    s["QuoteID"]     = pd.to_numeric(s["QuoteID"], errors="coerce").fillna(0).astype(int)
-    s["QuotedPrice"] = pd.to_numeric(s["QuotedPrice"], errors="coerce").fillna(0.0)
-    s["DepositPaid"] = pd.to_numeric(s["DepositPaid"], errors="coerce").fillna(0.0)
-    c["QuoteID"]     = pd.to_numeric(c["QuoteID"], errors="coerce").fillna(0).astype(int)
+    for df in (s, c):
+        if "QuoteID" in df.columns:
+            df["QuoteID"] = pd.to_numeric(df["QuoteID"], errors="coerce").fillna(0).astype(int)
+    s["QuotedPrice"] = pd.to_numeric(s.get("QuotedPrice", 0), errors="coerce").fillna(0.0)
+    s["DepositPaid"] = pd.to_numeric(s.get("DepositPaid", 0), errors="coerce").fillna(0.0)
 
-    # Compute balance map
-    if not s.empty:
-        balance = (s.set_index("QuoteID")["QuotedPrice"] - s.set_index("QuoteID")["DepositPaid"]).clip(lower=0.0)
-    else:
-        balance = pd.Series(dtype=float)
-
-    # Ensure BalanceDue column exists
-    if "BalanceDue" not in c.columns:
-        c["BalanceDue"] = pd.Series(dtype=float)
+    price_map = s.set_index("QuoteID")["QuotedPrice"]
+    paid_map  = s.set_index("QuoteID")["DepositPaid"]
+    balance   = (price_map - paid_map).clip(lower=0.0)
 
     if not c.empty:
         c["BalanceDue"] = c["QuoteID"].map(balance).fillna(0.0).astype(float)
-
+    else:
+        if "BalanceDue" not in c.columns:
+            c["BalanceDue"] = pd.Series(dtype="float")
     return c
-
 
 
 
@@ -493,9 +529,9 @@ if page == "Dashboard":
             ax.set_title("Revenue Breakdown by Status")
             st.pyplot(fig)
         else:
-            st.warning("No revenue data available for the selected filters.")
+            st.info("No revenue data available for the selected filters.")
     else:
-        st.warning("Sales data missing required columns for chart.")
+        st.info("Sales data missing required columns for chart.")
 
     # ---- Payments Overview (corrected buckets) ----
     st.subheader("Payments Overview")
@@ -514,25 +550,44 @@ if page == "Dashboard":
             ax2.set_xticklabels([f"{k} ({v:.1f}%)" for k, v in pct_labels.items()], rotation=45)
             st.pyplot(fig2)
         else:
-            st.warning("No payment data available for the selected filters.")
+            st.info("No payment data available for the selected filters.")
     else:
-        st.warning("No payment data available for the selected filters.")
+        st.info("No payment data available for the selected filters.")
 
     # ---- Assigned vs Pending Tasks (Won-only) ----
     st.subheader("Task Overview")
-    assigned_tasks = assignments["QuoteID"].dropna().astype(int).unique() if "QuoteID" in assignments.columns else []
-    won_quote_ids = won_sales["QuoteID"].dropna().astype(int).unique() if "QuoteID" in won_sales.columns else []
+
+    # QuoteIDs that have any assignment rows (unique)
+    assigned_tasks = (
+        assignments["QuoteID"].dropna().astype(int).unique()
+        if "QuoteID" in assignments.columns else []
+    )
+
+    # Won jobs under the current filters
+    won_quote_ids = (
+        won_sales["QuoteID"].dropna().astype(int).unique()
+        if "QuoteID" in won_sales.columns else []
+    )
+
+    # Pending = won jobs that don't appear in assignments
     pending_tasks = [qid for qid in won_quote_ids if qid not in set(assigned_tasks)]
 
-    col9, col10 = st.columns(2)
-    col9.metric("Assigned Tasks", len(assigned_tasks))
-    col10.metric("Pending Tasks", len(pending_tasks))
+    assigned_count = int(len(assigned_tasks))
+    pending_count  = int(len(pending_tasks))
 
-    fig3, ax3 = plt.subplots()
-    ax3.bar(["Assigned", "Pending"], [len(assigned_tasks), len(pending_tasks)], color=["green", "red"])
-    ax3.set_title("Assigned vs Pending Tasks")
-    ax3.set_ylabel("Number of Tasks")
-    st.pyplot(fig3)
+    # If nothing to show, display a friendly message and skip the chart
+    if assigned_count == 0 and pending_count == 0:
+        st.info("No task data available for the selected filters.")
+    else:
+        colA, colB = st.columns(2)
+        colA.metric("Assigned Tasks", assigned_count)
+        colB.metric("Pending Tasks", pending_count)
+
+        fig3, ax3 = plt.subplots()
+        ax3.bar(["Assigned", "Pending"], [assigned_count, pending_count], color=["green", "red"])
+        ax3.set_title("Assigned vs Pending Tasks")
+        ax3.set_ylabel("Number of Tasks")
+        st.pyplot(fig3)
 
 # ---------------- End Dashboard ----------------
 
